@@ -2,9 +2,11 @@ import { NextResponse } from "next/server";
 import { isAdminSessionValid } from "@/lib/admin-auth";
 import { contentBriefs } from "@/data/content-briefs";
 import { prisma } from "@/lib/prisma";
+import { ensureBlogSchema } from "@/lib/blog-schema";
 
 export async function POST() {
   if (!isAdminSessionValid()) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  await ensureBlogSchema();
   const result = await prisma.blogPost.createMany({
     skipDuplicates: true,
     data: contentBriefs.map(([slug, title, category]) => ({
