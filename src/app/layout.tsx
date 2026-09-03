@@ -3,7 +3,7 @@ import type { Metadata } from "next";
 
 export const metadata: Metadata = {
   title: "DiskSift — Make space for what matters",
-  description: "A private, guided storage checkup for Mac and iPhone."
+  description: "A private, Apple-notarized storage analyzer for Mac. DiskSift for iPhone is coming soon."
 };
 
 export default function RootLayout({

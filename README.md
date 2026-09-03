@@ -1,6 +1,6 @@
 # DiskSift
 
-A private, guided storage checkup for Mac and iPhone users, built with Next.js.
+A private, guided storage analyzer for Mac users, built with Next.js. DiskSift for iPhone is coming soon.
 
 ## Getting started
 
