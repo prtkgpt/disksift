@@ -43,6 +43,8 @@ struct CategoryTotal: Identifiable {
     @Published var error: String?
     @Published var selected: FileItem?
     @Published var duplicateGroups: [[FileItem]] = []
+    @Published var duplicateScanning = false
+    @Published var duplicatesAnalyzed = false
     @Published var searchText = ""
 
     var totalBytes: Int64 { files.reduce(0) { $0 + $1.bytes } }
@@ -62,12 +64,23 @@ struct CategoryTotal: Identifiable {
         if panel.runModal() == .OK, let url = panel.url { scan(url) }
     }
     func scan(_ url: URL) {
-        scanning = true; progress = 0; error = nil; files = []; duplicateGroups = []; scannedURL = url
+        scanning = true; progress = 0; error = nil; files = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; scannedURL = url
         Task.detached(priority: .userInitiated) {
             let found = Self.enumerateFiles(at: url)
-            await MainActor.run { self.files = found; self.progress = 0.82 }
-            let duplicates = Self.findDuplicates(in: found)
-            await MainActor.run { self.duplicateGroups = duplicates; self.progress = 1; self.scanning = false }
+            await MainActor.run { self.files = found; self.progress = 1; self.scanning = false }
+        }
+    }
+    func analyzeDuplicates() {
+        guard !duplicateScanning else { return }
+        let snapshot = files
+        duplicateScanning = true; duplicatesAnalyzed = false; duplicateGroups = []
+        Task.detached(priority: .utility) {
+            let duplicates = Self.findDuplicates(in: snapshot)
+            await MainActor.run {
+                self.duplicateGroups = duplicates
+                self.duplicateScanning = false
+                self.duplicatesAnalyzed = true
+            }
         }
     }
     nonisolated static func enumerateFiles(at url: URL) -> [FileItem] {
@@ -158,7 +171,37 @@ struct QuickWinsView: View { @EnvironmentObject var scan:ScanModel; var reclaima
 struct AllFilesView: View { @EnvironmentObject var scan:ScanModel; var body:some View { List(scan.filteredFiles.sorted{$0.bytes>$1.bytes}) { FileRow(item:$0,canTrash:true) }.overlay { if scan.filteredFiles.isEmpty { EmptyState(title:"No matching files",icon:"magnifyingglass",message:"Try a different search or folder.") } } } }
 struct LargeFilesView: View { @EnvironmentObject var scan: ScanModel; var body: some View { List { ForEach(scan.largeFiles.filter{$0.bytes >= 100_000_000}.prefix(100)) { FileRow(item: $0, canTrash: true) } }.overlay { if scan.files.isEmpty { EmptyState(title:"No files found",icon:"doc",message:"Choose another folder to scan.") } } } }
 struct OldFilesView: View { @EnvironmentObject var scan:ScanModel; var body:some View { List { ForEach(scan.oldFiles.prefix(250)) { FileRow(item:$0,canTrash:true) } }.overlay { if scan.oldFiles.isEmpty { EmptyState(title:"Nothing old found",icon:"clock",message:"No files in this scan are older than one year.") } } } }
-struct DuplicatesView: View { @EnvironmentObject var scan: ScanModel; var body: some View { List { ForEach(Array(scan.duplicateGroups.enumerated()), id: \.offset) { _, group in SwiftUI.Section("\(format((group.first?.bytes ?? 0) * Int64(group.count - 1))) recoverable · SHA-256 match") { ForEach(group) { FileRow(item: $0, canTrash: true) } } } }.overlay { if scan.duplicateGroups.isEmpty { EmptyState(title:"No exact duplicates",icon:"checkmark.circle",message:"DiskSift verified candidate files byte-for-byte using SHA-256 fingerprints.") } } } }
+struct DuplicatesView: View {
+    @EnvironmentObject var scan: ScanModel
+    var body: some View {
+        Group {
+            if scan.duplicateScanning {
+                VStack(spacing: 14) {
+                    ProgressView().controlSize(.large)
+                    Text("Verifying duplicate candidates…").font(.headline)
+                    Text("This reads file contents in the background. You can keep using other DiskSift views.").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if !scan.duplicatesAnalyzed {
+                VStack(spacing: 14) {
+                    Image(systemName: "square.on.square").font(.system(size: 42)).foregroundStyle(.purple)
+                    Text("Find exact duplicates").font(.title2.bold())
+                    Text("The fast scan groups candidates by size. Start verification when you need it; DiskSift will then compare their SHA-256 fingerprints.").multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 470)
+                    Button("Analyze Duplicates") { scan.analyzeDuplicates() }.buttonStyle(.borderedProminent).tint(.purple).controlSize(.large)
+                }
+            } else {
+                List {
+                    ForEach(Array(scan.duplicateGroups.enumerated()), id: \.offset) { _, group in
+                        SwiftUI.Section("\(format((group.first?.bytes ?? 0) * Int64(group.count - 1))) recoverable · SHA-256 match") {
+                            ForEach(group) { FileRow(item: $0, canTrash: true) }
+                        }
+                    }
+                }.overlay {
+                    if scan.duplicateGroups.isEmpty { EmptyState(title:"No exact duplicates",icon:"checkmark.circle",message:"DiskSift verified candidate files byte-for-byte using SHA-256 fingerprints.") }
+                }
+            }
+        }
+    }
+}
 struct DeveloperJunkView: View { @EnvironmentObject var scan:ScanModel; var body:some View { List { ForEach(scan.developerJunk.prefix(500)) { FileRow(item:$0,canTrash:true) } }.overlay { if scan.developerJunk.isEmpty { EmptyState(title:"No developer clutter found",icon:"hammer",message:"Scan your Home folder to find node_modules, DerivedData, simulator, npm, and Gradle artifacts.") } } } }
 struct ApplicationsView: View { var body: some View { EmptyState(title:"Scan the Applications folder",icon:"square.grid.2x2",message:"Choose /Applications to review installed app sizes. Leftover detection is planned for the next build.") } }
 
