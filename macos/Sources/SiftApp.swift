@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import CryptoKit
+import Security
 
 struct FileItem: Identifiable, Hashable, Sendable {
     let id = UUID()
@@ -8,6 +9,13 @@ struct FileItem: Identifiable, Hashable, Sendable {
     let bytes: Int64
     let modified: Date?
     var name: String { url.lastPathComponent }
+    var cleanupRestriction: String? {
+        let path = url.standardizedFileURL.path
+        if path.contains("/CoreSimulator/") { return "Managed by Xcode. Remove unused simulator runtimes in Xcode Settings instead of deleting their internal files." }
+        if ["/System/", "/Library/", "/private/", "/usr/", "/bin/", "/sbin/"].contains(where: path.hasPrefix) { return "Managed system location. Use the owning application's storage settings." }
+        if path.contains("/node_modules/") { return "Project dependency. Review the complete node_modules folder in Finder; deleting individual binaries can break your project." }
+        return nil
+    }
     var kind: String {
         let ext = url.pathExtension.lowercased()
         if ["jpg","jpeg","png","heic","gif","tiff","raw"].contains(ext) { return "Photos" }
@@ -25,14 +33,87 @@ struct CategoryTotal: Identifiable {
 }
 
 @MainActor final class LicenseManager: ObservableObject {
-    @Published var isPro = UserDefaults.standard.bool(forKey: "disksift.pro")
+    @Published var isPro: Bool
     @Published var showingLicense = false
-    func activate(_ key: String) -> Bool {
-        // Development license format. Replace this validator with signed server receipts before selling.
-        guard key.uppercased().hasPrefix("DISKSIFT-PRO-") && key.count >= 22 else { return false }
-        isPro = true; UserDefaults.standard.set(true, forKey: "disksift.pro"); return true
+    @Published var activationMessage: String?
+    private static let keychainService = "com.disksift.app.license"
+    private static let keychainAccount = "pro-license"
+
+    init() {
+        let storedKey = Self.loadLicenseKey()
+        isPro = storedKey != nil
+        if let storedKey { Task { _ = await validate(storedKey, interactive: false) } }
     }
-    func deactivate() { isPro = false; UserDefaults.standard.removeObject(forKey: "disksift.pro") }
+
+    func activate(_ key: String) async -> Bool {
+        await validate(key.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(), interactive: true)
+    }
+
+    private func validate(_ key: String, interactive: Bool) async -> Bool {
+        guard key.range(of: #"^DISKSIFT-PRO-(?:[A-Z0-9]{4}-){4}[A-Z0-9]{4}$"#, options: .regularExpression) != nil else {
+            activationMessage = "Enter the complete license key from your DiskSift email."
+            return false
+        }
+        do {
+            var request = URLRequest(url: URL(string: "https://www.disksift.com/api/license/activate")!)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 15
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "licenseKey": key,
+                "deviceId": Self.deviceID(),
+                "deviceName": Host.current().localizedName ?? "Mac"
+            ])
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let result = try JSONDecoder().decode(ActivationResponse.self, from: data)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 500
+            if status == 200 && result.valid {
+                try Self.saveLicenseKey(key)
+                isPro = true
+                activationMessage = nil
+                return true
+            }
+            if [400, 403, 409].contains(status) {
+                if !interactive { Self.deleteLicenseKey(); isPro = false }
+                activationMessage = result.message ?? "This license could not be activated."
+                return false
+            }
+            throw URLError(.badServerResponse)
+        } catch {
+            if interactive { activationMessage = "Activation is temporarily unavailable. Check your internet connection and try again." }
+            return false
+        }
+    }
+
+    func deactivate() {
+        Self.deleteLicenseKey()
+        isPro = false
+        activationMessage = nil
+    }
+
+    private struct ActivationResponse: Decodable { let valid: Bool; let message: String? }
+    private static func deviceID() -> String {
+        if let value = UserDefaults.standard.string(forKey: "disksift.device-id") { return value }
+        let value = UUID().uuidString
+        UserDefaults.standard.set(value, forKey: "disksift.device-id")
+        return value
+    }
+    private static func loadLicenseKey() -> String? {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService, kSecAttrAccount as String: keychainAccount, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let data = item as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+    private static func saveLicenseKey(_ key: String) throws {
+        deleteLicenseKey()
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService, kSecAttrAccount as String: keychainAccount, kSecValueData as String: Data(key.utf8), kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+    }
+    private static func deleteLicenseKey() {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: keychainService, kSecAttrAccount as String: keychainAccount]
+        SecItemDelete(query as CFDictionary)
+    }
 }
 
 @MainActor final class ScanModel: ObservableObject {
@@ -46,13 +127,24 @@ struct CategoryTotal: Identifiable {
     @Published var duplicateScanning = false
     @Published var duplicatesAnalyzed = false
     @Published var searchText = ""
+    @Published var cleanupBusy = false
+    @Published var status = ""
+    private var scanTask: Task<Void, Never>?
+    private var duplicateTask: Task<Void, Never>?
+    private var generation = UUID()
+
+    func cancelWork() {
+        scanTask?.cancel(); duplicateTask?.cancel(); generation = UUID()
+        scanning = false; duplicateScanning = false
+        status = "Stopped. You can start a smaller folder scan."
+    }
 
     var totalBytes: Int64 { files.reduce(0) { $0 + $1.bytes } }
     var categories: [CategoryTotal] {
         let colors: [String: Color] = ["Photos": .pink, "Videos": .purple, "Audio": .orange, "Archives": .teal, "Documents": .blue, "Applications": .indigo, "Other": .gray]
         return Dictionary(grouping: files, by: \.kind).map { CategoryTotal(name: $0.key, bytes: $0.value.reduce(0) { $0 + $1.bytes }, color: colors[$0.key] ?? .gray) }.sorted { $0.bytes > $1.bytes }
     }
-    var largeFiles: [FileItem] { files.sorted { $0.bytes > $1.bytes } }
+    var largeFiles: [FileItem] { files }
     var oldFiles: [FileItem] { files.filter { ($0.modified ?? .now) < Calendar.current.date(byAdding: .year, value: -1, to: .now)! }.sorted { ($0.modified ?? .now) < ($1.modified ?? .now) } }
     var developerJunk: [FileItem] { files.filter { item in let p=item.url.path.lowercased(); return p.contains("/node_modules/") || p.contains("/deriveddata/") || p.contains("/.gradle/") || p.contains("/.npm/") || p.contains("/coresimulator/") }.sorted { $0.bytes > $1.bytes } }
     var quickWins: [FileItem] { files.filter { item in let ext=item.url.pathExtension.lowercased(); let old=(item.modified ?? .now) < Calendar.current.date(byAdding:.day,value:-30,to:.now)!; return old && ["dmg","pkg","zip","iso"].contains(ext) }.sorted { $0.bytes > $1.bytes } }
@@ -64,19 +156,31 @@ struct CategoryTotal: Identifiable {
         if panel.runModal() == .OK, let url = panel.url { scan(url) }
     }
     func scan(_ url: URL) {
+        guard !cleanupBusy else { return }
+        cancelWork()
+        let token = generation
+        status = "Scanning file metadata in the background…"
         scanning = true; progress = 0; error = nil; files = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; scannedURL = url
-        Task.detached(priority: .userInitiated) {
-            let found = Self.enumerateFiles(at: url)
-            await MainActor.run { self.files = found; self.progress = 1; self.scanning = false }
+        scanTask = Task.detached(priority: .utility) {
+            let found = Self.enumerateFiles(at: url).sorted { $0.bytes > $1.bytes }
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard self.generation == token else { return }
+                self.files = found; self.progress = 1; self.scanning = false
+                self.status = "Scan complete. Review Quick Wins to start with old installers. Protected and unreadable locations may be excluded."
+            }
         }
     }
     func analyzeDuplicates() {
-        guard !duplicateScanning else { return }
+        guard !duplicateScanning && !scanning && !cleanupBusy else { return }
+        let token = generation
         let snapshot = files
         duplicateScanning = true; duplicatesAnalyzed = false; duplicateGroups = []
-        Task.detached(priority: .utility) {
+        duplicateTask = Task.detached(priority: .utility) {
             let duplicates = Self.findDuplicates(in: snapshot)
+            guard !Task.isCancelled else { return }
             await MainActor.run {
+                guard self.generation == token else { return }
                 self.duplicateGroups = duplicates
                 self.duplicateScanning = false
                 self.duplicatesAnalyzed = true
@@ -88,6 +192,7 @@ struct CategoryTotal: Identifiable {
         guard let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
         var found: [FileItem] = []
         while let fileURL = enumerator.nextObject() as? URL {
+            if Task.isCancelled { break }
             if let values = try? fileURL.resourceValues(forKeys: Set(keys)), values.isRegularFile == true, values.isSymbolicLink != true {
                 found.append(FileItem(url: fileURL, bytes: Int64(values.fileSize ?? 0), modified: values.contentModificationDate))
             }
@@ -98,6 +203,7 @@ struct CategoryTotal: Identifiable {
         let candidates = Dictionary(grouping: files.filter { $0.bytes > 1_000_000 }, by: \.bytes).values.filter { $0.count > 1 }
         var matches: [[FileItem]] = []
         for group in candidates {
+            if Task.isCancelled { break }
             let hashed = Dictionary(grouping: group, by: { fingerprint($0.url) ?? UUID().uuidString })
             matches.append(contentsOf: hashed.values.filter { $0.count > 1 })
         }
@@ -106,13 +212,37 @@ struct CategoryTotal: Identifiable {
     nonisolated static func fingerprint(_ url: URL) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }; var hasher = SHA256()
-        do { while true { let data = try handle.read(upToCount: 1_048_576) ?? Data(); if data.isEmpty { break }; hasher.update(data: data) } }
+        do { while true { if Task.isCancelled { return nil }; let data = try handle.read(upToCount: 1_048_576) ?? Data(); if data.isEmpty { break }; hasher.update(data: data) } }
         catch { return nil }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
     func trash(_ item: FileItem) {
-        do { try FileManager.default.trashItem(at: item.url, resultingItemURL: nil); files.removeAll { $0.id == item.id } }
-        catch { self.error = "Could not move \(item.name) to Trash: \(error.localizedDescription)" }
+        guard !cleanupBusy && !scanning && !duplicateScanning else { return }
+        if let reason = item.cleanupRestriction { error = reason; return }
+        cleanupBusy = true
+        status = "Moving \(item.name) to Trash…"
+        Task.detached(priority: .utility) {
+            let resolved = item.url.resolvingSymlinksInPath()
+            let checked = FileItem(url: resolved, bytes: item.bytes, modified: item.modified)
+            var failure: String?
+            if let reason = checked.cleanupRestriction { failure = reason }
+            else if !FileManager.default.isDeletableFile(atPath: item.url.path) {
+                failure = "This item cannot be removed by DiskSift. Reveal it in Finder or manage it in the owning app. Full Disk Access does not grant ownership of system files."
+            } else {
+                do { try FileManager.default.trashItem(at: item.url, resultingItemURL: nil) }
+                catch { failure = "Could not move \(item.name) to Trash: \(error.localizedDescription)" }
+            }
+            let result = failure
+            await MainActor.run {
+                self.cleanupBusy = false
+                if let result { self.error = result; self.status = "Item was not removed." }
+                else {
+                    self.files.removeAll { $0.id == item.id }
+                    self.duplicateGroups = []; self.duplicatesAnalyzed = false
+                    self.status = "Moved to Trash. Restore from Finder if needed. Disk space is released after Trash is emptied."
+                }
+            }
+        }
     }
 }
 
@@ -145,20 +275,20 @@ struct ContentView: View {
             }
             Spacer()
             VStack(alignment: .leading, spacing: 8) { Label("100% local", systemImage: "hand.raised.fill").font(.caption.bold()).foregroundStyle(.purple); Text("Names and scan results never leave your Mac.").font(.caption2).foregroundStyle(.secondary) }.padding(12).background(Color.purple.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-            if !license.isPro { Button("Unlock DiskSift Pro · $19.99") { license.showingLicense = true }.buttonStyle(.borderedProminent).tint(.purple).controlSize(.large) }
+            if !license.isPro { Button("Unlock DiskSift Pro · $12.99") { license.showingLicense = true }.buttonStyle(.borderedProminent).tint(.purple).controlSize(.large) }
             else { Label("DiskSift Pro", systemImage: "checkmark.seal.fill").foregroundStyle(.purple).font(.caption.bold()) }
         }.padding(18).navigationSplitViewColumnWidth(min: 210, ideal: 230)
     }
     @ViewBuilder var detail: some View {
         if scan.scannedURL == nil { WelcomeView() }
-        else { VStack(spacing: 0) { header; if scan.scanning { ProgressView(value: scan.progress).tint(.purple).padding(.horizontal, 28) }; Group { switch section { case .overview: OverviewView(); case .quick: QuickWinsView(); case .all: AllFilesView(); case .large: LargeFilesView(); case .old: OldFilesView(); case .duplicates: DuplicatesView(); case .developer: DeveloperJunkView(); case .applications: ApplicationsView() } } }.environmentObject(scan) }
+        else { VStack(spacing: 0) { header; if scan.scanning || scan.duplicateScanning { HStack { ProgressView().controlSize(.small); Text("Working in background"); Spacer(); Button("Stop") { scan.cancelWork() } }.padding(.horizontal, 28) }; Text(scan.status).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 28); Group { switch section { case .overview: OverviewView(); case .quick: QuickWinsView(); case .all: AllFilesView(); case .large: LargeFilesView(); case .old: OldFilesView(); case .duplicates: DuplicatesView(); case .developer: DeveloperJunkView(); case .applications: ApplicationsView() } } }.environmentObject(scan) }
     }
     var header: some View { HStack { VStack(alignment: .leading) { Text(section.rawValue).font(.title.bold()); Text(scan.scannedURL?.path(percentEncoded: false) ?? "").lineLimit(1).font(.caption).foregroundStyle(.secondary) }; Spacer(); TextField("Search files and folders", text:$scan.searchText).textFieldStyle(.roundedBorder).frame(maxWidth:260); Button { scan.chooseFolder() } label: { Label("Scan", systemImage: "folder.badge.gearshape") }.buttonStyle(.borderedProminent).tint(.purple) }.padding(24) }
 }
 
 struct WelcomeView: View {
     @EnvironmentObject var scan: ScanModel
-    var body: some View { VStack(spacing: 22) { Spacer(); Image(systemName: "externaldrive.fill.badge.magnifyingglass").font(.system(size: 70)).foregroundStyle(.purple.gradient); Text("See what’s taking up space.").font(.system(size: 36, weight: .bold)); Text("DiskSift analyzes metadata locally, verifies duplicates by content, and keeps every cleanup recoverable in Trash.").multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 520); HStack { Button { scan.scan(FileManager.default.homeDirectoryForCurrentUser) } label: { Label("Scan Home",systemImage:"house") }; Button { scan.chooseFolder() } label: { Label("Choose Folder",systemImage:"folder") }; Button { scan.scan(URL(fileURLWithPath:"/")) } label: { Label("Scan Full Mac",systemImage:"internaldrive") } }.buttonStyle(.borderedProminent).tint(.purple).controlSize(.large); Text("Full Mac scans may require Full Disk Access in System Settings.").font(.caption).foregroundStyle(.secondary); HStack(spacing: 20) { Label("Private", systemImage: "hand.raised"); Label("SHA-256 duplicates", systemImage: "checkmark.shield"); Label("Trash-first", systemImage: "trash.slash") }.font(.caption).foregroundStyle(.secondary); Spacer() }.padding(50) }
+    var body: some View { VStack(spacing: 22) { Spacer(); Image(systemName: "externaldrive.fill.badge.magnifyingglass").font(.system(size: 70)).foregroundStyle(.purple.gradient); Text("See what’s taking up space.").font(.system(size: 36, weight: .bold)); Text("DiskSift analyzes metadata locally, verifies duplicates by content, and keeps every cleanup recoverable in Trash.").multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 520); Button { scan.scan(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")) } label: { Label("Start with Downloads", systemImage: "bolt.fill") }.buttonStyle(.borderedProminent).tint(.purple).controlSize(.large); Text("Start here for installers, archives, and downloads you recognize. Review results before removal.").font(.caption).foregroundStyle(.secondary); HStack { Button { scan.scan(FileManager.default.homeDirectoryForCurrentUser) } label: { Label("Scan Home",systemImage:"house") }; Button { scan.chooseFolder() } label: { Label("Choose Folder",systemImage:"folder") }; Button { scan.scan(URL(fileURLWithPath:"/")) } label: { Label("Scan Full Mac",systemImage:"internaldrive") } }.buttonStyle(.borderedProminent).tint(.purple).controlSize(.large); Text("Full Mac scans may require Full Disk Access in System Settings.").font(.caption).foregroundStyle(.secondary); HStack(spacing: 20) { Label("Private", systemImage: "hand.raised"); Label("SHA-256 duplicates", systemImage: "checkmark.shield"); Label("Trash-first", systemImage: "trash.slash") }.font(.caption).foregroundStyle(.secondary); Spacer() }.padding(50) }
 }
 
 struct OverviewView: View {
@@ -168,7 +298,7 @@ struct OverviewView: View {
 
 struct EmptyState: View { let title:String, icon:String, message:String; var body: some View { VStack(spacing:12){Image(systemName:icon).font(.system(size:38)).foregroundStyle(.secondary);Text(title).font(.headline);Text(message).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)}.frame(maxWidth:420).padding(30) } }
 struct QuickWinsView: View { @EnvironmentObject var scan:ScanModel; var reclaimable:Int64 { scan.quickWins.reduce(0){$0+$1.bytes} }; var body:some View { VStack(spacing:0) { HStack { VStack(alignment:.leading,spacing:5){Text("Safe place to start").font(.title2.bold());Text("Old installers and archives are usually easy to review and replace.").foregroundStyle(.secondary)};Spacer();VStack(alignment:.trailing){Text(format(reclaimable)).font(.title2.bold()).foregroundStyle(.purple);Text("potential space").font(.caption).foregroundStyle(.secondary)}}.padding(20).background(Color.purple.opacity(0.08),in:RoundedRectangle(cornerRadius:14)).padding(.horizontal,24);List { ForEach(scan.quickWins) { FileRow(item:$0,canTrash:true) } }.overlay { if scan.quickWins.isEmpty { EmptyState(title:"No obvious quick wins",icon:"checkmark.seal",message:"No installers or archives older than 30 days were found in this scan.") } } } } }
-struct AllFilesView: View { @EnvironmentObject var scan:ScanModel; var body:some View { List(scan.filteredFiles.sorted{$0.bytes>$1.bytes}) { FileRow(item:$0,canTrash:true) }.overlay { if scan.filteredFiles.isEmpty { EmptyState(title:"No matching files",icon:"magnifyingglass",message:"Try a different search or folder.") } } } }
+struct AllFilesView: View { @EnvironmentObject var scan:ScanModel; var body:some View { List(scan.filteredFiles) { FileRow(item:$0,canTrash:true) }.overlay { if scan.filteredFiles.isEmpty { EmptyState(title:"No matching files",icon:"magnifyingglass",message:"Try a different search or folder.") } } } }
 struct LargeFilesView: View { @EnvironmentObject var scan: ScanModel; var body: some View { List { ForEach(scan.largeFiles.filter{$0.bytes >= 100_000_000}.prefix(100)) { FileRow(item: $0, canTrash: true) } }.overlay { if scan.files.isEmpty { EmptyState(title:"No files found",icon:"doc",message:"Choose another folder to scan.") } } } }
 struct OldFilesView: View { @EnvironmentObject var scan:ScanModel; var body:some View { List { ForEach(scan.oldFiles.prefix(250)) { FileRow(item:$0,canTrash:true) } }.overlay { if scan.oldFiles.isEmpty { EmptyState(title:"Nothing old found",icon:"clock",message:"No files in this scan are older than one year.") } } } }
 struct DuplicatesView: View {
@@ -196,7 +326,7 @@ struct DuplicatesView: View {
                         }
                     }
                 }.overlay {
-                    if scan.duplicateGroups.isEmpty { EmptyState(title:"No exact duplicates",icon:"checkmark.circle",message:"DiskSift verified candidate files byte-for-byte using SHA-256 fingerprints.") }
+                    if scan.duplicateGroups.isEmpty { EmptyState(title:"No exact duplicates",icon:"checkmark.circle",message:"No matching SHA-256 fingerprints were found among files larger than 1 MB.") }
                 }
             }
         }
@@ -206,11 +336,11 @@ struct DeveloperJunkView: View { @EnvironmentObject var scan:ScanModel; var body
 struct ApplicationsView: View { var body: some View { EmptyState(title:"Scan the Applications folder",icon:"square.grid.2x2",message:"Choose /Applications to review installed app sizes. Leftover detection is planned for the next build.") } }
 
 struct Metric: View { let title:String,value:String,icon:String; var body: some View { VStack(alignment:.leading,spacing:8){Image(systemName:icon).foregroundStyle(.purple);Text(value).font(.title2.bold());Text(title).font(.caption).foregroundStyle(.secondary)}.frame(maxWidth:.infinity,alignment:.leading).padding(16).background(Color(nsColor:.controlBackgroundColor),in:RoundedRectangle(cornerRadius:12)) } }
-struct FileRow: View { @EnvironmentObject var scan: ScanModel; let item:FileItem; var canTrash=false; var body: some View { HStack { Image(systemName:"doc.fill").foregroundStyle(.purple.opacity(0.75));VStack(alignment:.leading){Text(item.name).lineLimit(1);Text(item.url.deletingLastPathComponent().path(percentEncoded:false)).font(.caption2).foregroundStyle(.secondary).lineLimit(1)};Spacer();Text(format(item.bytes)).font(.caption.monospacedDigit());Button { NSWorkspace.shared.open(item.url) } label:{Image(systemName:"eye")}.buttonStyle(.borderless).help("Open file");Button { NSWorkspace.shared.activateFileViewerSelecting([item.url]) } label:{Image(systemName:"folder")}.buttonStyle(.borderless).help("Reveal in Finder");if canTrash { Button { scan.trash(item) } label:{Image(systemName:"trash")}.buttonStyle(.borderless).help("Move to Trash") } }.padding(.vertical,4) } }
+struct FileRow: View { @EnvironmentObject var scan: ScanModel; let item:FileItem; var canTrash=false; @State private var confirmTrash = false; var body: some View { HStack { Image(systemName:"doc.fill").foregroundStyle(.purple.opacity(0.75));VStack(alignment:.leading){Text(item.name).lineLimit(1);Text(item.url.deletingLastPathComponent().path(percentEncoded:false)).font(.caption2).foregroundStyle(.secondary).lineLimit(1)};Spacer();Text(format(item.bytes)).font(.caption.monospacedDigit());Button { NSWorkspace.shared.open(item.url) } label:{Image(systemName:"eye")}.buttonStyle(.borderless).help("Open file");Button { NSWorkspace.shared.activateFileViewerSelecting([item.url]) } label:{Image(systemName:"folder")}.buttonStyle(.borderless).help("Reveal in Finder");if canTrash { Button { if let reason = item.cleanupRestriction { scan.error = reason } else { confirmTrash = true } } label:{Image(systemName: item.cleanupRestriction == nil ? "trash" : "info.circle")}.buttonStyle(.borderless).disabled(scan.scanning || scan.duplicateScanning || scan.cleanupBusy).help(item.cleanupRestriction ?? "Review and move to Trash").confirmationDialog("Move \(item.name) to Trash?", isPresented: $confirmTrash) { Button("Move to Trash", role: .destructive) { scan.trash(item) }; Button("Cancel", role: .cancel) {} } message: { Text("Confirm you no longer need this file. You can restore it from Trash until Trash is emptied.") } } }.padding(.vertical,4) } }
 
 struct LicenseView: View {
-    @EnvironmentObject var license: LicenseManager; @Environment(\.dismiss) var dismiss; @State private var key=""; @State private var invalid=false
-    var body: some View { VStack(spacing:18) { Image(systemName:"sparkles").font(.system(size:38)).foregroundStyle(.purple);Text("Unlock DiskSift Pro").font(.title.bold());Text("One payment. Yours forever.").foregroundStyle(.secondary);Text("$19.99").font(.system(size:42,weight:.bold));VStack(alignment:.leading,spacing:8){Label("Find likely duplicate files",systemImage:"checkmark");Label("Review apps and leftovers",systemImage:"checkmark");Label("Unlimited scan results",systemImage:"checkmark");Label("Future Pro updates included",systemImage:"checkmark")}.font(.callout);Link("Buy a lifetime license",destination:URL(string:"https://disksift.com/buy")!).buttonStyle(.borderedProminent).tint(.purple).controlSize(.large);Divider();HStack{TextField("DISKSIFT-PRO-XXXX-XXXX",text:$key).textFieldStyle(.roundedBorder);Button("Activate"){if license.activate(key){dismiss()}else{invalid=true}}}.frame(maxWidth:360);if invalid{Text("That license key is not valid.").font(.caption).foregroundStyle(.red)};Button("Continue with Free") { dismiss() }.buttonStyle(.link) }.padding(32).frame(width:480) }
+    @EnvironmentObject var license: LicenseManager; @Environment(\.dismiss) var dismiss; @State private var key=""; @State private var activating=false
+    var body: some View { VStack(spacing:18) { Image(systemName:"sparkles").font(.system(size:38)).foregroundStyle(.purple);Text("Unlock DiskSift Pro").font(.title.bold());Text("One payment. Yours forever.").foregroundStyle(.secondary);Text("$12.99 launch price").font(.system(size:34,weight:.bold));VStack(alignment:.leading,spacing:8){Label("Find exact duplicate files",systemImage:"checkmark");Label("Review developer junk safely",systemImage:"checkmark");Label("Unlimited scan results",systemImage:"checkmark");Label("Use on three personal Macs",systemImage:"checkmark")}.font(.callout);Link("Buy a lifetime license",destination:URL(string:"https://disksift.com/buy")!).buttonStyle(.borderedProminent).tint(.purple).controlSize(.large);Divider();HStack{TextField("DISKSIFT-PRO-XXXX-XXXX-XXXX-XXXX-XXXX",text:$key).textFieldStyle(.roundedBorder).disabled(activating);Button(activating ? "Activating…" : "Activate"){activating=true;Task{if await license.activate(key){dismiss()};activating=false}}.disabled(activating)}.frame(maxWidth:420);if let message=license.activationMessage{Text(message).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center)};Text("Activation checks only your license and an anonymous device identifier. Your scan data never leaves your Mac.").font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center);Button("Continue with Free") { dismiss() }.buttonStyle(.link) }.padding(32).frame(width:500) }
 }
 struct SettingsView: View { @EnvironmentObject var license: LicenseManager; var body: some View { Form { SwiftUI.Section("License") { LabeledContent("Plan",value:license.isPro ? "DiskSift Pro · Lifetime" : "DiskSift Free");if license.isPro{Button("Deactivate this Mac",role:.destructive){license.deactivate()}}else{Button("Enter license key"){license.showingLicense=true}} }; SwiftUI.Section("Privacy") { Text("DiskSift scans locally and does not transmit file names, paths, or scan results.").foregroundStyle(.secondary) } }.padding(24) } }
 

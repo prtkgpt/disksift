@@ -8,14 +8,14 @@ const statuses = new Set(["DRAFT", "REVIEW", "SCHEDULED", "PUBLISHED"]);
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 export async function GET() {
-  if (!isAdminSessionValid()) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  if (!await isAdminSessionValid()) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   await ensureBlogSchema();
   const posts = await prisma.blogPost.findMany({ orderBy: { updatedAt: "desc" } });
   return NextResponse.json(posts);
 }
 
 export async function POST(request: Request) {
-  if (!isAdminSessionValid()) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  if (!await isAdminSessionValid()) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   await ensureBlogSchema();
   const input = await request.json();
   const title = String(input.title ?? "").trim();

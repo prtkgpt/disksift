@@ -5,7 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { ensureBlogSchema } from "@/lib/blog-schema";
 
 export async function POST() {
-  if (!isAdminSessionValid()) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  if (!await isAdminSessionValid()) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   await ensureBlogSchema();
   await prisma.$transaction(articleDrafts.map(draft => prisma.blogPost.upsert({
     where: { slug: draft.slug },

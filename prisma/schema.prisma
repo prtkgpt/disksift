@@ -177,3 +177,43 @@ model BlogPost {
   @@index([status, publishedAt])
   @@index([category])
 }
+
+// Stripe purchase entitlement and device activation records.
+model ProPurchase {
+  id              String   @id @default(cuid())
+  stripeSessionId String   @unique
+  stripeIntentId  String   @unique
+  customerEmail   String
+  amountCents     Int
+  currency        String
+  product         String   @default("disksift_pro")
+  maxDevices      Int      @default(3)
+  majorVersion    Int      @default(1)
+  livemode        Boolean  @default(false)
+  licenseKeyHash  String   @unique
+  licenseKeyLast4 String
+  status          String   @default("ACTIVE")
+  emailSentAt     DateTime?
+  refundedAt      DateTime?
+  createdAt       DateTime @default(now())
+  activations     LicenseActivation[]
+}
+
+model LicenseActivation {
+  id          String      @id @default(cuid())
+  purchase    ProPurchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  purchaseId  String
+  deviceHash  String
+  deviceName  String?
+  activatedAt DateTime    @default(now())
+  lastSeenAt  DateTime    @updatedAt
+
+  @@unique([purchaseId, deviceHash])
+  @@index([purchaseId])
+}
+
+model StripeWebhookEvent {
+  id          String   @id
+  type        String
+  processedAt DateTime @default(now())
+}

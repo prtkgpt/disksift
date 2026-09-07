@@ -14,6 +14,6 @@ The output is `dist/DiskSift.dmg`. This local build is ad-hoc signed for develop
 ## Product tiers
 
 - Free: local folder scans, storage categories, and the 20 largest files.
-- Pro ($19.99 one-time): duplicate discovery, app review, unlimited results, and future Pro updates.
+- Pro ($12.99 one-time launch price): exact duplicate discovery, developer-junk review, unlimited results, three personal Macs, and updates for major version 1.
 
 The current license validator is intentionally marked as development-only. Connect the purchase URL and replace it with signed license receipt verification before accepting payments.

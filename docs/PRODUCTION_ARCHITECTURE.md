@@ -3,7 +3,7 @@
 ## Recommended stack
 
 - **Website/API:** Next.js on Vercel at `disksift.com`
-- **Payments:** Stripe Checkout, one-time `payment` mode, $19.99
+- **Payments:** Stripe Checkout, one-time `payment` mode, $12.99 launch price
 - **Database:** Neon Postgres through Prisma
 - **Transactional email:** Resend from `licenses@disksift.com`
 - **Downloads:** Cloudflare R2 for versioned, signed/notarized DMGs; the website redirects `/download` to the current release

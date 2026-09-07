@@ -27,8 +27,8 @@ export function createAdminSession() {
   return `${payload}.${sign(payload)}`;
 }
 
-export function isAdminSessionValid() {
-  const token = cookies().get(COOKIE_NAME)?.value;
+export async function isAdminSessionValid() {
+  const token = (await cookies()).get(COOKIE_NAME)?.value;
   if (!token || !adminIsConfigured()) return false;
   const [payload, signature] = token.split(".");
   if (!payload || !signature || !safeEqual(signature, sign(payload))) return false;
@@ -36,8 +36,8 @@ export function isAdminSessionValid() {
   catch { return false; }
 }
 
-export function setAdminCookie(token: string) {
-  cookies().set(COOKIE_NAME, token, { httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "strict", path: "/", maxAge: MAX_AGE });
+export async function setAdminCookie(token: string) {
+  (await cookies()).set(COOKIE_NAME, token, { httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "strict", path: "/", maxAge: MAX_AGE });
 }
 
-export function clearAdminCookie() { cookies().set(COOKIE_NAME, "", { httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "strict", path: "/", maxAge: 0 }); }
+export async function clearAdminCookie() { (await cookies()).set(COOKIE_NAME, "", { httpOnly: true, secure: process.env.NODE_ENV === "production", sameSite: "strict", path: "/", maxAge: 0 }); }

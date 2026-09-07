@@ -25,15 +25,12 @@ npm run prisma:migrate
 npm run dev
 ```
 
-## Auth setup
-
-- Create a GitHub OAuth app and set the callback URL to `http://localhost:3000/api/auth/callback/github`.
-- Fill in `GITHUB_ID`, `GITHUB_SECRET`, and `NEXTAUTH_SECRET` (or `AUTH_SECRET`).
-
 ## Stripe setup
 
-- Add your Stripe keys to `.env`.
-- Configure the webhook endpoint: `/api/stripe/webhook`.
+- Add the Stripe and license variables documented in `.env.example`.
+- Configure the webhook endpoint as `https://www.disksift.com/api/stripe/webhook`.
+- Subscribe it to `checkout.session.completed`, `checkout.session.async_payment_succeeded`, and `charge.refunded`.
+- Keep `ALLOW_LIVE_PAYMENTS=false` until the live price, webhook, Resend sender, and end-to-end purchase test are ready.
 
 ## Project structure
 

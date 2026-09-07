@@ -7,6 +7,6 @@ export async function POST(request: Request) {
   if (!validateAdminCredentials(String(email), String(password))) {
     return NextResponse.json({ error: "Invalid email or password." }, { status: 401 });
   }
-  setAdminCookie(createAdminSession());
+  await setAdminCookie(createAdminSession());
   return NextResponse.json({ ok: true });
 }
