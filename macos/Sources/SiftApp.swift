@@ -177,6 +177,9 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     @Published private(set) var safeFiles: [FileItem] = []
     @Published private(set) var oldFiles: [FileItem] = []
     @Published private(set) var quickWins: [FileItem] = []
+    @Published private(set) var planLargeFiles: [FileItem] = []
+    @Published private(set) var planOldFiles: [FileItem] = []
+    @Published private(set) var planQuickWins: [FileItem] = []
     @Published var scanning = false
     @Published var progress = 0.0
     @Published var scannedURL: URL?
@@ -218,9 +221,9 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     var selectedItems: [FileItem] { files.filter { selectedIDs.contains($0.id) } }
     var selectedBytes: Int64 { selectedItems.reduce(0) { $0 + $1.bytes } }
     var selectedUnsafeCount: Int { selectedItems.filter { safetyReason(for:$0) == nil }.count }
-    var safeQuickWins: [FileItem] { quickWins.filter { $0.cleanupRestriction == nil && $0.isPlanEligible } }
-    var safeLargeFiles: [FileItem] { files.filter { $0.bytes >= 100_000_000 && $0.cleanupRestriction == nil && $0.isPlanEligible }.sorted { $0.bytes > $1.bytes } }
-    var safeOldFiles: [FileItem] { oldFiles.filter { $0.cleanupRestriction == nil && $0.isPlanEligible } }
+    var safeQuickWins: [FileItem] { planQuickWins }
+    var safeLargeFiles: [FileItem] { planLargeFiles }
+    var safeOldFiles: [FileItem] { planOldFiles }
     var cleanupCandidates: [FileItem] {
         var seen: Set<UUID> = []
         return (safeQuickWins + safeLargeFiles + safeOldFiles).filter { seen.insert($0.id).inserted }
@@ -237,14 +240,23 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         return (safeFiles + duplicateCopies).filter { seen.insert($0.id).inserted }.sorted { $0.bytes > $1.bytes }
     }
     func rebuildIndexes() {
-        categoryBytes = [:]; categoryIndex = [:]; totalBytes = 0; safeFiles = []; oldFiles = []; quickWins = []
+        categoryBytes = [:]; categoryIndex = [:]; totalBytes = 0; safeFiles = []; oldFiles = []; quickWins = []; planLargeFiles = []; planOldFiles = []; planQuickWins = []
         let oldCutoff=Calendar.current.date(byAdding:.year,value:-1,to:.now)!, quickCutoff=Calendar.current.date(byAdding:.day,value:-30,to:.now)!
-        for item in files { totalBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item); if item.safeToDeleteReason != nil { safeFiles.append(item) }; if (item.modified ?? .now) < oldCutoff { oldFiles.append(item) }; if (item.modified ?? .now) < quickCutoff && ["dmg","pkg","zip","iso"].contains(item.url.pathExtension.lowercased()) { quickWins.append(item) } }
+        for item in files {
+            totalBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item)
+            if item.safeToDeleteReason != nil { safeFiles.append(item) }
+            if (item.modified ?? .now) < oldCutoff { oldFiles.append(item); if item.cleanupRestriction == nil && item.isPlanEligible { planOldFiles.append(item) } }
+            if (item.modified ?? .now) < quickCutoff && ["dmg","pkg","zip","iso"].contains(item.url.pathExtension.lowercased()) { quickWins.append(item); if item.cleanupRestriction == nil && item.isPlanEligible { planQuickWins.append(item) } }
+            if item.bytes >= 100_000_000 && item.cleanupRestriction == nil && item.isPlanEligible { planLargeFiles.append(item) }
+        }
         for key in Array(categoryIndex.keys) { categoryIndex[key]?.sort { $0.bytes > $1.bytes } }
         largestFiles = Array(files.sorted { $0.bytes > $1.bytes }.prefix(100))
         safeFiles.sort { $0.bytes > $1.bytes }
         oldFiles.sort { ($0.modified ?? .now) < ($1.modified ?? .now) }
         quickWins.sort { $0.bytes > $1.bytes }
+        planLargeFiles.sort { $0.bytes > $1.bytes }
+        planOldFiles.sort { ($0.modified ?? .now) < ($1.modified ?? .now) }
+        planQuickWins.sort { $0.bytes > $1.bytes }
     }
 
     func toggleSelection(_ item: FileItem) {
@@ -268,12 +280,22 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         cancelWork()
         let token = generation
         status = "Scanning file metadata in the background…"
-        scanning = true; progress = 0; error = nil; files = []; largestFiles = []; totalBytes = 0; safeFiles = []; oldFiles = []; quickWins = []; categoryBytes = [:]; categoryIndex = [:]; duplicateCopyIDs = []; selectedIDs = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; developerTargets = []; developerAnalyzed = false; scannedURL = url
+        scanning = true; progress = 0; error = nil; files = []; largestFiles = []; totalBytes = 0; safeFiles = []; oldFiles = []; quickWins = []; planLargeFiles = []; planOldFiles = []; planQuickWins = []; categoryBytes = [:]; categoryIndex = [:]; duplicateCopyIDs = []; selectedIDs = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; developerTargets = []; developerAnalyzed = false; scannedURL = url
         let oldCutoff=Calendar.current.date(byAdding:.year,value:-1,to:.now)!, quickCutoff=Calendar.current.date(byAdding:.day,value:-30,to:.now)!
         scanTask = Task {
             for await batch in Self.fileBatches(at: url) {
                 guard !Task.isCancelled, generation == token else { return }
-                for item in batch { totalBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item); if item.safeToDeleteReason != nil { safeFiles.append(item) }; if (item.modified ?? .now) < oldCutoff { oldFiles.append(item) }; if (item.modified ?? .now) < quickCutoff && ["dmg","pkg","zip","iso"].contains(item.url.pathExtension.lowercased()) { quickWins.append(item) } }
+                var batchBytes:Int64=0, batchSafe:[FileItem]=[], batchOld:[FileItem]=[], batchQuick:[FileItem]=[], batchPlanLarge:[FileItem]=[], batchPlanOld:[FileItem]=[], batchPlanQuick:[FileItem]=[]
+                for item in batch {
+                    batchBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item)
+                    if item.safeToDeleteReason != nil { batchSafe.append(item) }
+                    if (item.modified ?? .now) < oldCutoff { batchOld.append(item); if item.cleanupRestriction == nil && item.isPlanEligible { batchPlanOld.append(item) } }
+                    if (item.modified ?? .now) < quickCutoff && ["dmg","pkg","zip","iso"].contains(item.url.pathExtension.lowercased()) { batchQuick.append(item); if item.cleanupRestriction == nil && item.isPlanEligible { batchPlanQuick.append(item) } }
+                    if item.bytes >= 100_000_000 && item.cleanupRestriction == nil && item.isPlanEligible { batchPlanLarge.append(item) }
+                }
+                totalBytes += batchBytes
+                safeFiles.append(contentsOf:batchSafe); oldFiles.append(contentsOf:batchOld); quickWins.append(contentsOf:batchQuick)
+                planLargeFiles.append(contentsOf:batchPlanLarge); planOldFiles.append(contentsOf:batchPlanOld); planQuickWins.append(contentsOf:batchPlanQuick)
                 largestFiles = Array((largestFiles + batch).sorted { $0.bytes > $1.bytes }.prefix(100))
                 files.append(contentsOf: batch)
                 progress = Double(files.count)
@@ -387,7 +409,7 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
                     if Task.isCancelled { break }
                     if let values = try? fileURL.resourceValues(forKeys: Set(keys)), values.isRegularFile == true, values.isSymbolicLink != true {
                         batch.append(FileItem(url: fileURL, bytes: Int64(values.fileSize ?? 0), modified: values.contentModificationDate))
-                        if batch.count >= 200 { continuation.yield(batch); batch.removeAll(keepingCapacity: true) }
+                        if batch.count >= 5_000 { continuation.yield(batch); batch.removeAll(keepingCapacity: true) }
                     }
                 }
                 if !batch.isEmpty { continuation.yield(batch) }
