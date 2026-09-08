@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { LegalLayout } from "@/components/LegalLayout";
 
 export const metadata: Metadata = { title: "Terms of Service — DiskSift", description: "Terms governing use of DiskSift for macOS." };
@@ -13,7 +14,7 @@ export default function TermsPage() {
     <section><h2>6. Acceptable use</h2><p>You may not reverse engineer DiskSift except where applicable law expressly permits it, interfere with its licensing service, use it unlawfully, or distribute modified copies as an official DiskSift release.</p></section>
     <section><h2>7. Disclaimer</h2><p>DiskSift is provided “as is” and “as available” to the extent permitted by law. We disclaim implied warranties including merchantability, fitness for a particular purpose, and non-infringement. Nothing in these Terms excludes rights that cannot legally be excluded.</p></section>
     <section><h2>8. Limitation of liability</h2><p>To the extent permitted by law, DiskSift will not be liable for indirect, incidental, special, consequential, or punitive damages, loss of data, or loss of profits arising from use of the software. Our total liability will not exceed the amount you paid for DiskSift during the twelve months preceding the claim.</p></section>
-    <section><h2>9. Refunds and termination</h2><p>Eligible purchases are covered by our <a href="/refund-policy">Refund Policy</a>. We may suspend a license obtained fraudulently, shared beyond its permitted use, refunded, charged back, or used in material violation of these Terms.</p></section>
-    <section><h2>10. Contact</h2><p>Questions about these Terms can be sent to <a href="mailto:support@disksift.com">support@disksift.com</a>.</p></section>
+    <section><h2>9. Refunds and termination</h2><p>Eligible purchases are covered by our <Link href="/refund-policy">Refund Policy</Link>. We may suspend a license obtained fraudulently, shared beyond its permitted use, refunded, charged back, or used in material violation of these Terms.</p></section>
+    <section><h2>10. Contact</h2><p>Questions about these Terms can be sent to <a href="mailto:hello@disksift.com">hello@disksift.com</a>.</p></section>
   </LegalLayout>;
 }

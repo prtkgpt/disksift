@@ -2,11 +2,13 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { ensurePaymentSchema } from "@/lib/payment-schema";
 import { deviceHash, licenseKeyHash, normalizeLicenseKey } from "@/lib/license";
+import { withinRateLimit } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   try {
+    if (!await withinRateLimit(request, "license-activation", 60, 60 * 60)) return NextResponse.json({ valid: false, message: "Too many activation attempts. Try again later." }, { status: 429, headers: { "cache-control": "no-store" } });
     const input = await request.json();
     const licenseKey = normalizeLicenseKey(String(input.licenseKey ?? ""));
     const deviceId = String(input.deviceId ?? "").trim();

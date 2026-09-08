@@ -48,7 +48,7 @@ const answers: Record<string, string> = {
   "are-mac-cleaner-apps-safe": "A safer cleaner is transparent, notarized, local-first, reversible, and confirmation-based. Avoid tools that call broad system folders junk.",
   "storage-analyzer-privacy": "A private analyzer should not upload file names, paths, contents, folder structure, hashes, or scan history. Licensing should use minimal disclosed data.",
   "trash-vs-permanent-delete-mac": "Trash provides a review window; permanent deletion does not. Use Trash, test your Mac, and empty it only when confident.",
-  "disksift-free-vs-pro": "Free includes local scans, large-file discovery, search, and manual actions. The $12.99 one-time Pro launch edition adds exact duplicates, developer-junk discovery, unlimited results, and activation on three personal Macs.",
+  "disksift-free-vs-pro": "Free includes progressive local scans, large-file discovery, search, and individual Trash-first actions. The $12.99 one-time Pro launch edition adds a cleanup plan, multi-select batch cleanup, exact duplicates with keeper guidance, actionable developer-folder cleanup, and activation on three personal Macs.",
   "how-to-use-disksift": "Install the notarized app, select a scan scope, review the largest categories, and use Reveal or Trash only for recognized items. Full Disk Access is optional for protected locations.",
   "disksift-apple-notarized": "DiskSift's DMG is Developer ID-signed and accepted by Apple's automated notary service. Notarization assists Gatekeeper; it is not App Store review or a guarantee of every cleanup decision."
 };

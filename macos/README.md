@@ -9,11 +9,11 @@ chmod +x build-dmg.sh
 ./build-dmg.sh
 ```
 
-The output is `dist/DiskSift.dmg`. This local build is ad-hoc signed for development. Public distribution requires an Apple Developer ID certificate and notarization.
+The output is `dist/DiskSift.dmg`. The release script creates a universal Apple silicon/Intel build, signs it with the configured Developer ID identity, submits it with the configured notary profile, staples the ticket, and verifies the finished DMG.
 
 ## Product tiers
 
-- Free: local folder scans, storage categories, and the 20 largest files.
-- Pro ($12.99 one-time launch price): exact duplicate discovery, developer-junk review, unlimited results, three personal Macs, and updates for major version 1.
+- Free: progressive local scans, storage categories, large and old file discovery, search, and individual Trash-first cleanup.
+- Pro ($12.99 one-time launch price): cleanup plans, multi-select batch cleanup, exact duplicates with keeper guidance, actionable developer-folder cleanup, three personal Macs, and updates for major version 1.
 
-The current license validator is intentionally marked as development-only. Connect the purchase URL and replace it with signed license receipt verification before accepting payments.
+Pro activation is validated by the production license API and stored in the user’s macOS Keychain.

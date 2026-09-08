@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getStripe } from "@/lib/stripe";
 import { getProPriceId, getSiteUrl, PRO, validateProPrice } from "@/lib/pro-purchase";
 import { stripeIsLive } from "@/lib/stripe";
+import { withinRateLimit } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
 
@@ -11,6 +12,7 @@ export async function POST(req: NextRequest) {
     if (req.headers.get("origin") !== siteUrl) {
       return NextResponse.json({ error: "Invalid request origin" }, { status: 403 });
     }
+    if (!await withinRateLimit(req, "checkout", 20, 60 * 60)) return NextResponse.json({ error: "Too many checkout attempts. Try again later." }, { status: 429 });
     const stripe = getStripe();
     const priceId = getProPriceId();
     validateProPrice(await stripe.prices.retrieve(priceId));

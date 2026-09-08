@@ -46,6 +46,17 @@ struct CleanupReceipt: Identifiable {
     let completedAt: Date
 }
 
+enum DeveloperCleanupKind: String, Hashable, Sendable { case derivedData, npmCache, gradleCache, homebrewCache, nodeModules }
+
+struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
+    var id: String { url.standardizedFileURL.path }
+    let url: URL
+    let title: String
+    let detail: String
+    let bytes: Int64
+    let kind: DeveloperCleanupKind
+}
+
 @MainActor final class LicenseManager: ObservableObject {
     @Published var isPro: Bool
     @Published var showingLicense = false
@@ -140,6 +151,9 @@ struct CleanupReceipt: Identifiable {
     @Published var duplicateGroups: [[FileItem]] = []
     @Published var duplicateScanning = false
     @Published var duplicatesAnalyzed = false
+    @Published var developerTargets: [DeveloperCleanupTarget] = []
+    @Published var developerScanning = false
+    @Published var developerAnalyzed = false
     @Published var searchText = ""
     @Published var cleanupBusy = false
     @Published var status = ""
@@ -148,11 +162,12 @@ struct CleanupReceipt: Identifiable {
     @Published var showingCleanupReceipt = false
     private var scanTask: Task<Void, Never>?
     private var duplicateTask: Task<Void, Never>?
+    private var developerTask: Task<Void, Never>?
     private var generation = UUID()
 
     func cancelWork() {
-        scanTask?.cancel(); duplicateTask?.cancel(); generation = UUID()
-        scanning = false; duplicateScanning = false
+        scanTask?.cancel(); duplicateTask?.cancel(); developerTask?.cancel(); generation = UUID()
+        scanning = false; duplicateScanning = false; developerScanning = false
         status = "Stopped. You can start a smaller folder scan."
     }
 
@@ -197,7 +212,7 @@ struct CleanupReceipt: Identifiable {
         cancelWork()
         let token = generation
         status = "Scanning file metadata in the background…"
-        scanning = true; progress = 0; error = nil; files = []; selectedIDs = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; scannedURL = url
+        scanning = true; progress = 0; error = nil; files = []; selectedIDs = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; developerTargets = []; developerAnalyzed = false; scannedURL = url
         scanTask = Task {
             for await batch in Self.fileBatches(at: url) {
                 guard !Task.isCancelled, generation == token else { return }
@@ -225,6 +240,70 @@ struct CleanupReceipt: Identifiable {
                 self.duplicatesAnalyzed = true
             }
         }
+    }
+    func analyzeDeveloperStorage() {
+        guard !developerScanning && !cleanupBusy else { return }
+        let token = generation
+        let snapshot = files
+        developerScanning = true; developerAnalyzed = false; developerTargets = []
+        status = "Measuring safe developer cleanup folders in the background…"
+        developerTask = Task.detached(priority: .utility) {
+            let targets = Self.findDeveloperTargets(from: snapshot)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard self.generation == token else { return }
+                self.developerTargets = targets; self.developerScanning = false; self.developerAnalyzed = true
+                self.status = targets.isEmpty ? "No supported developer cleanup folders were found." : "Developer cleanup ready. Review complete folders before moving them to Trash."
+            }
+        }
+    }
+    nonisolated static func findDeveloperTargets(from files: [FileItem]) -> [DeveloperCleanupTarget] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let known: [(String,String,String,DeveloperCleanupKind)] = [
+            ("Library/Developer/Xcode/DerivedData", "Xcode DerivedData", "Build indexes and intermediates. Xcode recreates them; close Xcode before cleanup.", .derivedData),
+            (".npm/_cacache", "npm download cache", "Downloaded package cache. npm recreates it as packages are installed.", .npmCache),
+            (".gradle/caches", "Gradle cache", "Downloaded dependencies and build cache. Gradle recreates it when needed.", .gradleCache),
+            ("Library/Caches/Homebrew", "Homebrew cache", "Downloaded formula and cask files. Homebrew can download them again.", .homebrewCache)
+        ]
+        var targets: [DeveloperCleanupTarget] = known.compactMap { relative,title,detail,kind in
+            let url = home.appendingPathComponent(relative, isDirectory: true)
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            let bytes = allocatedSize(of: url)
+            guard bytes > 0 else { return nil }
+            return DeveloperCleanupTarget(url:url,title:title,detail:detail,bytes:bytes,kind:kind)
+        }
+        var moduleBytes: [URL:Int64] = [:]
+        for item in files {
+            if Task.isCancelled { return [] }
+            let components = item.url.standardizedFileURL.pathComponents
+            guard let index = components.firstIndex(of: "node_modules") else { continue }
+            let path = NSString.path(withComponents: Array(components.prefix(through:index)))
+            let url = URL(fileURLWithPath:path, isDirectory:true)
+            guard url.path.hasPrefix(home.path + "/") else { continue }
+            moduleBytes[url, default:0] += item.bytes
+        }
+        targets += moduleBytes.sorted { $0.value > $1.value }.prefix(30).map { url,bytes in
+            DeveloperCleanupTarget(url:url,title:"node_modules · \(url.deletingLastPathComponent().lastPathComponent)",detail:"Project dependencies. Confirm the project has a package lockfile and reinstall after cleanup.",bytes:bytes,kind:.nodeModules)
+        }
+        return targets.sorted { $0.bytes > $1.bytes }
+    }
+    nonisolated static func allocatedSize(of url: URL) -> Int64 {
+        let keys: Set<URLResourceKey> = [.isRegularFileKey,.isSymbolicLinkKey,.totalFileAllocatedSizeKey,.fileAllocatedSizeKey,.fileSizeKey]
+        guard let enumerator = FileManager.default.enumerator(at:url,includingPropertiesForKeys:Array(keys),options:[.skipsPackageDescendants]) else { return 0 }
+        var total:Int64 = 0
+        while let item = enumerator.nextObject() as? URL {
+            if Task.isCancelled { break }
+            guard let values = try? item.resourceValues(forKeys:keys), values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            total += Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? values.fileSize ?? 0)
+        }
+        return total
+    }
+    nonisolated static func allowedDeveloperTarget(_ target: DeveloperCleanupTarget) -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        let path = target.url.standardizedFileURL.path
+        let fixed = ["\(home)/Library/Developer/Xcode/DerivedData","\(home)/.npm/_cacache","\(home)/.gradle/caches","\(home)/Library/Caches/Homebrew"]
+        if fixed.contains(path) { return true }
+        return target.kind == .nodeModules && path.hasPrefix(home + "/") && target.url.lastPathComponent == "node_modules"
     }
     nonisolated static func fileBatches(at url: URL) -> AsyncStream<[FileItem]> {
         AsyncStream { continuation in
@@ -329,6 +408,46 @@ struct CleanupReceipt: Identifiable {
                 self.cleanupReceipt = CleanupReceipt(movedCount: movedIDs.count, movedBytes: movedBytes, failedCount: failed, completedAt: .now)
                 self.showingCleanupReceipt = true
                 self.status = failed == 0 ? "Cleanup complete. Items are recoverable from Trash." : "Cleanup finished. \(failed) item(s) were left in place because macOS did not allow access."
+            }
+        }
+    }
+    func trashDeveloperTarget(_ target: DeveloperCleanupTarget) {
+        guard !cleanupBusy && Self.allowedDeveloperTarget(target) else { error = "DiskSift blocked this folder because it is outside the supported developer cleanup locations."; return }
+        guard FileManager.default.fileExists(atPath:target.url.path) else { error = "This folder no longer exists. Refresh developer storage to update the list."; return }
+        cleanupBusy = true; status = "Moving \(target.title) to Trash…"
+        Task.detached(priority:.utility) {
+            var failure:String?
+            if !Self.allowedDeveloperTarget(target) { failure = "Safety validation failed; the folder was left in place." }
+            else if !FileManager.default.isDeletableFile(atPath:target.url.path) { failure = "macOS did not allow DiskSift to move this folder. Close the owning developer tool and try again." }
+            else { do { try FileManager.default.trashItem(at:target.url,resultingItemURL:nil) } catch { failure = error.localizedDescription } }
+            if failure == nil && UserDefaults.standard.bool(forKey:"disksift.share-anonymous-impact") { await Self.reportAnonymousCleanup(bytes:target.bytes) }
+            await MainActor.run {
+                self.cleanupBusy = false
+                if let failure { self.error = "Could not move \(target.title) to Trash: \(failure)"; self.status = "Developer folder was left in place."; return }
+                let prefix = target.url.standardizedFileURL.path + "/"
+                self.files.removeAll { $0.url.standardizedFileURL.path.hasPrefix(prefix) }
+                self.developerTargets.removeAll { $0.id == target.id }
+                self.cleanupReceipt = CleanupReceipt(movedCount:1,movedBytes:target.bytes,failedCount:0,completedAt:.now)
+                self.showingCleanupReceipt = true
+                self.status = "Moved \(target.title) to Trash. Reopen the developer tool when you want it regenerated."
+            }
+        }
+    }
+    func removeUnavailableSimulators() {
+        guard !cleanupBusy else { return }
+        cleanupBusy = true; status = "Asking Xcode to remove unavailable simulator devices…"
+        Task.detached(priority:.utility) {
+            let process = Process(); let output = Pipe()
+            process.executableURL = URL(fileURLWithPath:"/usr/bin/xcrun")
+            process.arguments = ["simctl","delete","unavailable"]
+            process.standardOutput = output; process.standardError = output
+            var message:String?; var success = false
+            do { try process.run(); process.waitUntilExit(); success = process.terminationStatus == 0; if !success { message = String(data:output.fileHandleForReading.readDataToEndOfFile(),encoding:.utf8) } }
+            catch { message = error.localizedDescription }
+            await MainActor.run {
+                self.cleanupBusy = false
+                if success { self.status = "Xcode removed unavailable simulator devices. Scan again to refresh storage totals." }
+                else { self.error = "Xcode could not remove unavailable simulators. \(message?.trimmingCharacters(in:.whitespacesAndNewlines) ?? "Open Xcode Settings and manage Platforms manually.")"; self.status = "Simulator cleanup did not complete." }
             }
         }
     }
@@ -470,7 +589,25 @@ struct DuplicateGroupView: View {
         }
     }
 }
-struct DeveloperJunkView: View { @EnvironmentObject var scan:ScanModel; var body:some View { List { ForEach(scan.developerJunk.prefix(500)) { FileRow(item:$0,canTrash:true) } }.overlay { if scan.developerJunk.isEmpty { EmptyState(title:"No developer clutter found",icon:"hammer",message:"Scan your Home folder to find node_modules, DerivedData, simulator, npm, and Gradle artifacts.") } } } }
+struct DeveloperJunkView: View {
+    @EnvironmentObject var scan:ScanModel
+    @State private var confirmSimulators=false
+    var total:Int64 { scan.developerTargets.reduce(0) { $0 + $1.bytes } }
+    var body:some View {
+        VStack(spacing:12) {
+            HStack { VStack(alignment:.leading,spacing:4) { Text("Regeneratable developer storage").font(.title2.bold()); Text("Complete folders only—never individual runtime or dependency files.").foregroundStyle(.secondary) }; Spacer(); VStack(alignment:.trailing) { Text(format(total)).font(.title2.bold()).foregroundStyle(.purple); Text("reviewable").font(.caption).foregroundStyle(.secondary) }; Button(scan.developerAnalyzed ? "Refresh" : "Analyze") { scan.analyzeDeveloperStorage() }.disabled(scan.developerScanning || scan.cleanupBusy) }.padding(18).background(Color.purple.opacity(0.08),in:RoundedRectangle(cornerRadius:14)).padding(.horizontal,24)
+            GroupBox { HStack { VStack(alignment:.leading,spacing:4) { Text("Unavailable simulator devices").font(.headline); Text("Runs Apple’s `xcrun simctl delete unavailable`. This does not touch active simulators, but this action is not recoverable from Trash.").font(.caption).foregroundStyle(.secondary) }; Spacer(); Button("Remove unavailable") { confirmSimulators=true }.disabled(scan.cleanupBusy) }.padding(8) } label:{ Label("Xcode-managed cleanup",systemImage:"iphone.and.arrow.forward") }.padding(.horizontal,24).confirmationDialog("Remove unavailable simulator devices?",isPresented:$confirmSimulators) { Button("Remove Unavailable Devices",role:.destructive) { scan.removeUnavailableSimulators() }; Button("Cancel",role:.cancel) {} } message:{ Text("Xcode will permanently remove simulator devices it marks unavailable. Active devices and runtimes are not targeted.") }
+            if scan.developerScanning { VStack(spacing:10) { ProgressView(); Text("Measuring developer folders without blocking the app…").font(.caption).foregroundStyle(.secondary) }.frame(maxWidth:.infinity,maxHeight:.infinity) }
+            else { List { ForEach(scan.developerTargets) { DeveloperTargetRow(target:$0) } }.overlay { if scan.developerAnalyzed && scan.developerTargets.isEmpty { EmptyState(title:"Developer storage looks clean",icon:"checkmark.seal",message:"No supported caches, DerivedData, or scanned node_modules folders were found.") } } }
+        }.task { if !scan.developerAnalyzed && !scan.developerScanning { scan.analyzeDeveloperStorage() } }
+    }
+}
+struct DeveloperTargetRow: View {
+    @EnvironmentObject var scan:ScanModel
+    let target:DeveloperCleanupTarget
+    @State private var confirm=false
+    var body:some View { HStack(spacing:12) { Image(systemName:"folder.badge.gearshape").foregroundStyle(.purple); VStack(alignment:.leading,spacing:3) { Text(target.title).font(.headline); Text(target.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2); Text(target.url.path(percentEncoded:false)).font(.caption2).foregroundStyle(.tertiary).lineLimit(1) }; Spacer(); Text(format(target.bytes)).font(.caption.monospacedDigit()); Button { NSWorkspace.shared.activateFileViewerSelecting([target.url]) } label:{ Image(systemName:"folder") }.buttonStyle(.borderless).help("Reveal in Finder"); Button("Move to Trash") { confirm=true }.disabled(scan.cleanupBusy).confirmationDialog("Move \(target.title) to Trash?",isPresented:$confirm) { Button("Move Folder to Trash",role:.destructive) { scan.trashDeveloperTarget(target) }; Button("Cancel",role:.cancel) {} } message:{ Text("\(target.detail) The complete folder will be recoverable until you empty Trash.") } }.padding(.vertical,5) }
+}
 struct Metric: View { let title:String,value:String,icon:String; var body: some View { VStack(alignment:.leading,spacing:8){Image(systemName:icon).foregroundStyle(.purple);Text(value).font(.title2.bold());Text(title).font(.caption).foregroundStyle(.secondary)}.frame(maxWidth:.infinity,alignment:.leading).padding(16).background(Color(nsColor:.controlBackgroundColor),in:RoundedRectangle(cornerRadius:12)) } }
 struct FileRow: View { @EnvironmentObject var scan: ScanModel; @EnvironmentObject var license:LicenseManager; let item:FileItem; var canTrash=false; var badge:String?=nil; @State private var confirmTrash = false; var body: some View { HStack { if canTrash && license.isPro && item.cleanupRestriction == nil { Button { scan.toggleSelection(item) } label:{Image(systemName:scan.selectedIDs.contains(item.id) ? "checkmark.square.fill" : "square").foregroundStyle(scan.selectedIDs.contains(item.id) ? .purple : .secondary)}.buttonStyle(.borderless).disabled(scan.scanning || scan.duplicateScanning || scan.cleanupBusy).help("Select for cleanup") };Image(systemName:"doc.fill").foregroundStyle(.purple.opacity(0.75));VStack(alignment:.leading){HStack { Text(item.name).lineLimit(1); if let badge { Text(badge).font(.caption2.bold()).foregroundStyle(.green).padding(.horizontal,5).background(Color.green.opacity(0.12),in:Capsule()) } };Text(item.url.deletingLastPathComponent().path(percentEncoded:false)).font(.caption2).foregroundStyle(.secondary).lineLimit(1)};Spacer();Text(format(item.bytes)).font(.caption.monospacedDigit());Button { NSWorkspace.shared.open(item.url) } label:{Image(systemName:"eye")}.buttonStyle(.borderless).help("Open file");Button { NSWorkspace.shared.activateFileViewerSelecting([item.url]) } label:{Image(systemName:"folder")}.buttonStyle(.borderless).help("Reveal in Finder");if canTrash { Button { if let reason = item.cleanupRestriction { scan.error = reason } else { confirmTrash = true } } label:{Image(systemName: item.cleanupRestriction == nil ? "trash" : "info.circle")}.buttonStyle(.borderless).disabled(scan.scanning || scan.duplicateScanning || scan.cleanupBusy).help(item.cleanupRestriction ?? "Review and move to Trash").confirmationDialog("Move \(item.name) to Trash?", isPresented: $confirmTrash) { Button("Move to Trash", role: .destructive) { scan.trash(item) }; Button("Cancel", role: .cancel) {} } message: { Text("Confirm you no longer need this file. You can restore it from Trash until Trash is emptied.") } } }.padding(.vertical,4) } }
 
