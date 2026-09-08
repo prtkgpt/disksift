@@ -217,3 +217,21 @@ model StripeWebhookEvent {
   type        String
   processedAt DateTime @default(now())
 }
+
+model DownloadEvent {
+  id        String   @id
+  edition   String
+  source    String
+  createdAt DateTime @default(now())
+
+  @@index([edition, createdAt])
+}
+
+model CleanupReport {
+  id               String   @id
+  installationHash String
+  bytesCleaned     BigInt
+  createdAt        DateTime @default(now())
+
+  @@index([createdAt])
+}

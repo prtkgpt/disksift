@@ -1,5 +1,5 @@
 export function BlogCta() {
-  return <section className="blog-cta"><div><span>READY TO FIND YOUR SPACE?</span><h2>See what is filling up your Mac.</h2><p>Scan locally, understand the largest folders, and review every cleanup action before anything moves to Trash.</p></div><div className="blog-cta-actions"><a className="primary" href="/downloads/DiskSift.dmg" download>Download DiskSift Free ↓</a><a href="/#pricing">Explore Pro · $12.99 once</a><small>Launch price · Apple notarized · No subscription</small></div></section>;
+  return <section className="blog-cta"><div><span>READY TO FIND YOUR SPACE?</span><h2>See what is filling up your Mac.</h2><p>Scan locally, understand the largest folders, and review every cleanup action before anything moves to Trash.</p></div><div className="blog-cta-actions"><a className="primary" href="/api/download?edition=free&source=blog-cta">Download DiskSift Free ↓</a><a href="/#pricing">Explore Pro · $12.99 once</a><small>Launch price · Apple notarized · No subscription</small></div></section>;
 }
 
 export function SiteFooter() {

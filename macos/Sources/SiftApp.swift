@@ -232,6 +232,9 @@ struct CategoryTotal: Identifiable {
                 do { try FileManager.default.trashItem(at: item.url, resultingItemURL: nil) }
                 catch { failure = "Could not move \(item.name) to Trash: \(error.localizedDescription)" }
             }
+            if failure == nil && UserDefaults.standard.bool(forKey: "disksift.share-anonymous-impact") {
+                await Self.reportAnonymousCleanup(bytes: item.bytes)
+            }
             let result = failure
             await MainActor.run {
                 self.cleanupBusy = false
@@ -243,6 +246,19 @@ struct CategoryTotal: Identifiable {
                 }
             }
         }
+    }
+    nonisolated static func reportAnonymousCleanup(bytes: Int64) async {
+        let defaults = UserDefaults.standard
+        let key = "disksift.impact-installation-id"
+        let installationId = defaults.string(forKey: key) ?? UUID().uuidString
+        defaults.set(installationId, forKey: key)
+        guard let url = URL(string: "https://www.disksift.com/api/metrics/cleanup"),
+              let body = try? JSONSerialization.data(withJSONObject: ["eventId": UUID().uuidString, "installationId": installationId, "bytesCleaned": bytes]) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"; request.timeoutInterval = 8
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        _ = try? await URLSession.shared.data(for: request)
     }
 }
 
@@ -342,6 +358,6 @@ struct LicenseView: View {
     @EnvironmentObject var license: LicenseManager; @Environment(\.dismiss) var dismiss; @State private var key=""; @State private var activating=false
     var body: some View { VStack(spacing:18) { Image(systemName:"sparkles").font(.system(size:38)).foregroundStyle(.purple);Text("Unlock DiskSift Pro").font(.title.bold());Text("One payment. Yours forever.").foregroundStyle(.secondary);Text("$12.99 launch price").font(.system(size:34,weight:.bold));VStack(alignment:.leading,spacing:8){Label("Find exact duplicate files",systemImage:"checkmark");Label("Review developer junk safely",systemImage:"checkmark");Label("Unlimited scan results",systemImage:"checkmark");Label("Use on three personal Macs",systemImage:"checkmark")}.font(.callout);Link("Buy a lifetime license",destination:URL(string:"https://disksift.com/buy")!).buttonStyle(.borderedProminent).tint(.purple).controlSize(.large);Divider();HStack{TextField("DISKSIFT-PRO-XXXX-XXXX-XXXX-XXXX-XXXX",text:$key).textFieldStyle(.roundedBorder).disabled(activating);Button(activating ? "Activating…" : "Activate"){activating=true;Task{if await license.activate(key){dismiss()};activating=false}}.disabled(activating)}.frame(maxWidth:420);if let message=license.activationMessage{Text(message).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center)};Text("Activation checks only your license and an anonymous device identifier. Your scan data never leaves your Mac.").font(.caption2).foregroundStyle(.secondary).multilineTextAlignment(.center);Button("Continue with Free") { dismiss() }.buttonStyle(.link) }.padding(32).frame(width:500) }
 }
-struct SettingsView: View { @EnvironmentObject var license: LicenseManager; var body: some View { Form { SwiftUI.Section("License") { LabeledContent("Plan",value:license.isPro ? "DiskSift Pro · Lifetime" : "DiskSift Free");if license.isPro{Button("Deactivate this Mac",role:.destructive){license.deactivate()}}else{Button("Enter license key"){license.showingLicense=true}} }; SwiftUI.Section("Privacy") { Text("DiskSift scans locally and does not transmit file names, paths, or scan results.").foregroundStyle(.secondary) } }.padding(24) } }
+struct SettingsView: View { @EnvironmentObject var license: LicenseManager; @AppStorage("disksift.share-anonymous-impact") private var shareImpact=false; var body: some View { Form { SwiftUI.Section("License") { LabeledContent("Plan",value:license.isPro ? "DiskSift Pro · Lifetime" : "DiskSift Free");if license.isPro{Button("Deactivate this Mac",role:.destructive){license.deactivate()}}else{Button("Enter license key"){license.showingLicense=true}} }; SwiftUI.Section("Privacy") { Toggle("Share anonymous cleaned-space totals",isOn:$shareImpact);Text(shareImpact ? "DiskSift sends only bytes moved to Trash and a pseudonymous installation ID—never file names, paths, contents, or scan results." : "Off by default. DiskSift does not send cleanup totals.").font(.caption).foregroundStyle(.secondary) } }.padding(24) } }
 
 func format(_ bytes:Int64)->String { ByteCountFormatter.string(fromByteCount:bytes,countStyle:.file) }
