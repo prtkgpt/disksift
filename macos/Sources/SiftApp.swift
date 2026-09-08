@@ -35,7 +35,7 @@ struct FileItem: Identifiable, Hashable, Sendable {
 }
 
 struct CategoryTotal: Identifiable {
-    let id = UUID(); let name: String; let bytes: Int64; let color: Color
+    var id: String { name }; let name: String; let bytes: Int64; let color: Color
 }
 
 struct CleanupReceipt: Identifiable {
@@ -143,6 +143,8 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
 
 @MainActor final class ScanModel: ObservableObject {
     @Published var files: [FileItem] = []
+    @Published private(set) var largestFiles: [FileItem] = []
+    @Published private(set) var totalBytes: Int64 = 0
     @Published var scanning = false
     @Published var progress = 0.0
     @Published var scannedURL: URL?
@@ -164,6 +166,8 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     private var duplicateTask: Task<Void, Never>?
     private var developerTask: Task<Void, Never>?
     private var generation = UUID()
+    private var categoryBytes: [String:Int64] = [:]
+    private var categoryIndex: [String:[FileItem]] = [:]
 
     func cancelWork() {
         scanTask?.cancel(); duplicateTask?.cancel(); developerTask?.cancel(); generation = UUID()
@@ -171,12 +175,11 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         status = "Stopped. You can start a smaller folder scan."
     }
 
-    var totalBytes: Int64 { files.reduce(0) { $0 + $1.bytes } }
     var categories: [CategoryTotal] {
         let colors: [String: Color] = ["Photos": .pink, "Videos": .purple, "Audio": .orange, "Archives": .teal, "Documents": .blue, "Applications": .indigo, "Other": .gray]
-        return Dictionary(grouping: files, by: \.kind).map { CategoryTotal(name: $0.key, bytes: $0.value.reduce(0) { $0 + $1.bytes }, color: colors[$0.key] ?? .gray) }.sorted { $0.bytes > $1.bytes }
+        return categoryBytes.map { CategoryTotal(name:$0.key,bytes:$0.value,color:colors[$0.key] ?? .gray) }.sorted { $0.bytes > $1.bytes }
     }
-    var largeFiles: [FileItem] { files }
+    var largeFiles: [FileItem] { largestFiles }
     var oldFiles: [FileItem] { files.filter { ($0.modified ?? .now) < Calendar.current.date(byAdding: .year, value: -1, to: .now)! }.sorted { ($0.modified ?? .now) < ($1.modified ?? .now) } }
     var developerJunk: [FileItem] { files.filter { item in let p=item.url.path.lowercased(); return p.contains("/node_modules/") || p.contains("/deriveddata/") || p.contains("/.gradle/") || p.contains("/.npm/") || p.contains("/coresimulator/") }.sorted { $0.bytes > $1.bytes } }
     var quickWins: [FileItem] { files.filter { item in let ext=item.url.pathExtension.lowercased(); let old=(item.modified ?? .now) < Calendar.current.date(byAdding:.day,value:-30,to:.now)!; return old && ["dmg","pkg","zip","iso"].contains(ext) }.sorted { $0.bytes > $1.bytes } }
@@ -189,6 +192,15 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     var cleanupCandidates: [FileItem] {
         var seen: Set<UUID> = []
         return (safeQuickWins + safeLargeFiles + safeOldFiles).filter { seen.insert($0.id).inserted }
+    }
+
+    func categoryFiles(named category: String) -> [FileItem] { categoryIndex[category] ?? [] }
+    func categoryTotal(named category: String) -> Int64 { categoryBytes[category] ?? 0 }
+    func rebuildIndexes() {
+        categoryBytes = [:]; categoryIndex = [:]; totalBytes = 0
+        for item in files { totalBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item) }
+        for key in Array(categoryIndex.keys) { categoryIndex[key]?.sort { $0.bytes > $1.bytes } }
+        largestFiles = Array(files.sorted { $0.bytes > $1.bytes }.prefix(100))
     }
 
     func toggleSelection(_ item: FileItem) {
@@ -212,16 +224,20 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         cancelWork()
         let token = generation
         status = "Scanning file metadata in the background…"
-        scanning = true; progress = 0; error = nil; files = []; selectedIDs = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; developerTargets = []; developerAnalyzed = false; scannedURL = url
+        scanning = true; progress = 0; error = nil; files = []; largestFiles = []; totalBytes = 0; categoryBytes = [:]; categoryIndex = [:]; selectedIDs = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; developerTargets = []; developerAnalyzed = false; scannedURL = url
         scanTask = Task {
             for await batch in Self.fileBatches(at: url) {
                 guard !Task.isCancelled, generation == token else { return }
+                for item in batch { totalBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item) }
+                largestFiles = Array((largestFiles + batch).sorted { $0.bytes > $1.bytes }.prefix(100))
                 files.append(contentsOf: batch)
                 progress = Double(files.count)
                 status = "Scanning… \(files.count.formatted()) files found. Results are ready to review as they appear."
             }
             guard !Task.isCancelled, generation == token else { return }
-            files.sort { $0.bytes > $1.bytes }; scanning = false
+            files.sort { $0.bytes > $1.bytes }
+            for key in Array(categoryIndex.keys) { categoryIndex[key]?.sort { $0.bytes > $1.bytes } }
+            largestFiles = Array(files.prefix(100)); scanning = false
             status = "Scan complete. Build a Cleanup Plan or start with old installers in Quick Wins."
         }
     }
@@ -375,6 +391,7 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
                 if let result { self.error = result; self.status = "Item was not removed." }
                 else {
                     self.files.removeAll { $0.id == item.id }
+                    self.rebuildIndexes()
                     self.selectedIDs.remove(item.id)
                     self.duplicateGroups = []; self.duplicatesAnalyzed = false
                     self.cleanupReceipt = CleanupReceipt(movedCount: 1, movedBytes: item.bytes, failedCount: 0, completedAt: .now)
@@ -403,6 +420,7 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
             if movedBytes > 0 && UserDefaults.standard.bool(forKey: "disksift.share-anonymous-impact") { await Self.reportAnonymousCleanup(bytes: movedBytes) }
             await MainActor.run {
                 self.files.removeAll { movedIDs.contains($0.id) }
+                self.rebuildIndexes()
                 self.selectedIDs.subtract(movedIDs)
                 self.cleanupBusy = false; self.duplicateGroups = []; self.duplicatesAnalyzed = false
                 self.cleanupReceipt = CleanupReceipt(movedCount: movedIDs.count, movedBytes: movedBytes, failedCount: failed, completedAt: .now)
@@ -426,10 +444,41 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
                 if let failure { self.error = "Could not move \(target.title) to Trash: \(failure)"; self.status = "Developer folder was left in place."; return }
                 let prefix = target.url.standardizedFileURL.path + "/"
                 self.files.removeAll { $0.url.standardizedFileURL.path.hasPrefix(prefix) }
+                self.rebuildIndexes()
                 self.developerTargets.removeAll { $0.id == target.id }
                 self.cleanupReceipt = CleanupReceipt(movedCount:1,movedBytes:target.bytes,failedCount:0,completedAt:.now)
                 self.showingCleanupReceipt = true
                 self.status = "Moved \(target.title) to Trash. Reopen the developer tool when you want it regenerated."
+            }
+        }
+    }
+    func trashDeveloperTargets(_ targets: [DeveloperCleanupTarget]) {
+        guard !cleanupBusy else { return }
+        let candidates = targets.filter { Self.allowedDeveloperTarget($0) }
+        guard !candidates.isEmpty else { error = "There is no supported developer storage to clean up."; return }
+        cleanupBusy = true; status = "Moving \(candidates.count) developer folders to Trash…"
+        Task.detached(priority:.utility) {
+            var movedIDs:Set<String> = []; var movedBytes:Int64 = 0; var failed = 0; var movedPrefixes:[String] = []
+            for target in candidates {
+                if Task.isCancelled { break }
+                guard Self.allowedDeveloperTarget(target),
+                      FileManager.default.fileExists(atPath:target.url.path),
+                      FileManager.default.isDeletableFile(atPath:target.url.path) else { failed += 1; continue }
+                do {
+                    try FileManager.default.trashItem(at:target.url,resultingItemURL:nil)
+                    movedIDs.insert(target.id); movedBytes += target.bytes
+                    movedPrefixes.append(target.url.standardizedFileURL.path + "/")
+                } catch { failed += 1 }
+            }
+            if movedBytes > 0 && UserDefaults.standard.bool(forKey:"disksift.share-anonymous-impact") { await Self.reportAnonymousCleanup(bytes:movedBytes) }
+            await MainActor.run {
+                self.cleanupBusy = false
+                self.files.removeAll { item in movedPrefixes.contains { item.url.standardizedFileURL.path.hasPrefix($0) } }
+                self.rebuildIndexes()
+                self.developerTargets.removeAll { movedIDs.contains($0.id) }
+                self.cleanupReceipt = CleanupReceipt(movedCount:movedIDs.count,movedBytes:movedBytes,failedCount:failed,completedAt:.now)
+                self.showingCleanupReceipt = true
+                self.status = failed == 0 ? "Cleanup complete. Developer folders are recoverable from Trash." : "Cleanup finished. \(failed) folder(s) stayed in place; close the owning developer tools and try again."
             }
         }
     }
@@ -503,7 +552,7 @@ struct ContentView: View {
     }
     @ViewBuilder var detail: some View {
         if scan.scannedURL == nil { WelcomeView() }
-        else { VStack(spacing: 0) { header; if scan.scanning || scan.duplicateScanning { HStack { ProgressView().controlSize(.small); Text(scan.scanning ? "\(scan.files.count.formatted()) files found" : "Verifying duplicates"); Spacer(); Button("Stop") { scan.cancelWork() } }.padding(.horizontal, 28) }; Text(scan.status).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 28); Group { switch section { case .overview: OverviewView(); case .cleanup: CleanupPlanView(); case .quick: QuickWinsView(); case .all: AllFilesView(); case .large: LargeFilesView(); case .old: OldFilesView(); case .duplicates: DuplicatesView(); case .developer: DeveloperJunkView() } }; if license.isPro && !scan.selectedIDs.isEmpty { HStack { VStack(alignment:.leading) { Text("\(scan.selectedIDs.count) selected").font(.headline); Text("\(format(scan.selectedBytes)) will move to Trash").font(.caption).foregroundStyle(.secondary) }; Spacer(); Button("Clear") { scan.clearSelection() }; Button("Review & Move to Trash") { confirmBatch = true }.buttonStyle(.borderedProminent).tint(.purple).disabled(scan.cleanupBusy || scan.scanning) }.padding(14).background(.bar).confirmationDialog("Move \(scan.selectedIDs.count) items to Trash?", isPresented: $confirmBatch) { Button("Move \(scan.selectedIDs.count) Items to Trash", role:.destructive) { scan.trashSelected() }; Button("Cancel", role:.cancel) {} } message: { Text("DiskSift will leave protected or inaccessible items untouched. You can restore moved items until you empty Trash.") } } }.environmentObject(scan).environmentObject(license) }
+        else { VStack(spacing: 0) { header; if scan.scanning || scan.duplicateScanning { HStack { ProgressView().controlSize(.small); Text(scan.scanning ? "\(scan.files.count.formatted()) files found" : "Verifying duplicates"); Spacer(); Button("Stop") { scan.cancelWork() } }.padding(.horizontal, 28) }; Text(scan.status).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 28); Group { switch section { case .overview: OverviewView(); case .cleanup: CleanupPlanView(); case .quick: QuickWinsView(); case .all: AllFilesView(); case .large: LargeFilesView(); case .old: OldFilesView(); case .duplicates: DuplicatesView(); case .developer: DeveloperJunkView() } }; if license.isPro && !scan.selectedIDs.isEmpty { HStack { VStack(alignment:.leading) { Text("\(scan.selectedIDs.count) selected").font(.headline); Text("\(format(scan.selectedBytes)) will move to Trash").font(.caption).foregroundStyle(.secondary) }; Spacer(); Button("Clear") { scan.clearSelection() }; Button("Clean This Up") { confirmBatch = true }.buttonStyle(.borderedProminent).tint(.purple).disabled(scan.cleanupBusy || scan.scanning) }.padding(14).background(.bar).confirmationDialog("Move \(scan.selectedIDs.count) items to Trash?", isPresented: $confirmBatch) { Button("Move \(scan.selectedIDs.count) Items to Trash", role:.destructive) { scan.trashSelected() }; Button("Cancel", role:.cancel) {} } message: { Text("DiskSift will leave protected or inaccessible items untouched. You can restore moved items until you empty Trash.") } } }.environmentObject(scan).environmentObject(license) }
     }
     var header: some View { HStack { VStack(alignment: .leading) { Text(section.rawValue).font(.title.bold()); Text(scan.scannedURL?.path(percentEncoded: false) ?? "").lineLimit(1).font(.caption).foregroundStyle(.secondary) }; Spacer(); TextField("Search files and folders", text:$scan.searchText).textFieldStyle(.roundedBorder).frame(maxWidth:260); Button { scan.chooseFolder() } label: { Label("Scan", systemImage: "folder.badge.gearshape") }.buttonStyle(.borderedProminent).tint(.purple) }.padding(24) }
 }
@@ -515,7 +564,43 @@ struct WelcomeView: View {
 
 struct OverviewView: View {
     @EnvironmentObject var scan: ScanModel
-    var body: some View { ScrollView { VStack(alignment: .leading, spacing: 18) { HStack(spacing: 14) { Metric(title: "Analyzed", value: format(scan.totalBytes), icon: "internaldrive"); Metric(title: "Files", value: scan.files.count.formatted(), icon: "doc.on.doc"); Metric(title: "Largest file", value: format(scan.largeFiles.first?.bytes ?? 0), icon: "arrow.up.right") }; GroupBox { VStack(spacing: 14) { ForEach(scan.categories) { item in HStack { Circle().fill(item.color).frame(width: 9,height: 9); Text(item.name).frame(width: 100, alignment: .leading); GeometryReader { geo in RoundedRectangle(cornerRadius: 4).fill(item.color.opacity(0.2)).overlay(alignment: .leading) { RoundedRectangle(cornerRadius: 4).fill(item.color).frame(width: max(4,geo.size.width * CGFloat(item.bytes) / CGFloat(max(scan.totalBytes,1)))) } }.frame(height: 9); Text(format(item.bytes)).font(.caption.monospacedDigit()).frame(width: 75,alignment:.trailing) } } }.padding(8) } label: { Label("Storage categories", systemImage: "chart.bar.fill").font(.headline) }; Text("Largest items").font(.headline); ForEach(scan.largeFiles.prefix(5)) { FileRow(item: $0) } }.padding(28) } }
+    @State private var selectedCategory:String?
+    var body: some View {
+        Group {
+            if let selectedCategory { CategoryFilesView(category:selectedCategory) { self.selectedCategory=nil } }
+            else { ScrollView { VStack(alignment:.leading,spacing:18) {
+                HStack(spacing:14) { Metric(title:"Analyzed",value:format(scan.totalBytes),icon:"internaldrive"); Metric(title:"Files",value:scan.files.count.formatted(),icon:"doc.on.doc"); Metric(title:"Largest file",value:format(scan.largeFiles.first?.bytes ?? 0),icon:"arrow.up.right") }
+                GroupBox { VStack(spacing:6) { ForEach(scan.categories) { item in Button { selectedCategory=item.name } label:{ HStack { Circle().fill(item.color).frame(width:9,height:9); Text(item.name).frame(width:100,alignment:.leading); GeometryReader { geo in RoundedRectangle(cornerRadius:4).fill(item.color.opacity(0.2)).overlay(alignment:.leading) { RoundedRectangle(cornerRadius:4).fill(item.color).frame(width:max(4,geo.size.width * CGFloat(item.bytes) / CGFloat(max(scan.totalBytes,1)))) } }.frame(height:9); Text(format(item.bytes)).font(.caption.monospacedDigit()).frame(width:75,alignment:.trailing); Image(systemName:"chevron.right").font(.caption).foregroundStyle(.secondary) }.contentShape(Rectangle()).padding(.vertical,5) }.buttonStyle(.plain) } }.padding(8) } label:{ Label("Storage categories",systemImage:"chart.bar.fill").font(.headline) }
+                Text("Largest items").font(.headline)
+                ForEach(scan.largeFiles.prefix(5)) { FileRow(item:$0) }
+            }.padding(28) } }
+        }
+    }
+}
+
+struct CategoryFilesView: View {
+    @EnvironmentObject var scan:ScanModel
+    @EnvironmentObject var license:LicenseManager
+    let category:String
+    let onBack:()->Void
+    @State private var limit=500
+    var items:[FileItem] { scan.categoryFiles(named:category) }
+    var body:some View {
+        VStack(spacing:0) {
+            HStack(spacing:14) {
+                Button(action:onBack) { Label("Categories",systemImage:"chevron.left") }
+                VStack(alignment:.leading,spacing:3) { Text(category).font(.title2.bold()); Text("\(items.count.formatted()) files · \(format(scan.categoryTotal(named:category)))").font(.caption).foregroundStyle(.secondary) }
+                Spacer()
+                if license.isPro { Button("Select All") { scan.select(items) }.disabled(items.isEmpty || scan.scanning); Button("Clear") { scan.clearSelection() }.disabled(scan.selectedIDs.isEmpty) }
+                else { Button("Unlock cleanup") { license.showingLicense=true }.buttonStyle(.borderedProminent).tint(.purple) }
+            }.padding(.horizontal,24).padding(.bottom,12)
+            if scan.scanning { Text("Results update while scanning. Select All becomes available when the scan finishes.").font(.caption).foregroundStyle(.secondary).padding(.bottom,8) }
+            List {
+                ForEach(items.prefix(limit)) { FileRow(item:$0,canTrash:true) }
+                if items.count > limit { Button("Load \(min(500,items.count-limit)) more") { limit += 500 }.frame(maxWidth:.infinity).padding(8) }
+            }.overlay { if items.isEmpty { EmptyState(title:"No \(category.lowercased()) found",icon:"tray",message:"This category has no files in the current scan.") } }
+        }
+    }
 }
 
 struct EmptyState: View { let title:String, icon:String, message:String; var body: some View { VStack(spacing:12){Image(systemName:icon).font(.system(size:38)).foregroundStyle(.secondary);Text(title).font(.headline);Text(message).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)}.frame(maxWidth:420).padding(30) } }
@@ -592,10 +677,11 @@ struct DuplicateGroupView: View {
 struct DeveloperJunkView: View {
     @EnvironmentObject var scan:ScanModel
     @State private var confirmSimulators=false
+    @State private var confirmCleanup=false
     var total:Int64 { scan.developerTargets.reduce(0) { $0 + $1.bytes } }
     var body:some View {
         VStack(spacing:12) {
-            HStack { VStack(alignment:.leading,spacing:4) { Text("Regeneratable developer storage").font(.title2.bold()); Text("Complete folders only—never individual runtime or dependency files.").foregroundStyle(.secondary) }; Spacer(); VStack(alignment:.trailing) { Text(format(total)).font(.title2.bold()).foregroundStyle(.purple); Text("reviewable").font(.caption).foregroundStyle(.secondary) }; Button(scan.developerAnalyzed ? "Refresh" : "Analyze") { scan.analyzeDeveloperStorage() }.disabled(scan.developerScanning || scan.cleanupBusy) }.padding(18).background(Color.purple.opacity(0.08),in:RoundedRectangle(cornerRadius:14)).padding(.horizontal,24)
+            HStack { VStack(alignment:.leading,spacing:4) { Text("Regeneratable developer storage").font(.title2.bold()); Text("Complete folders only—never individual runtime or dependency files.").foregroundStyle(.secondary) }; Spacer(); VStack(alignment:.trailing) { Text(format(total)).font(.title2.bold()).foregroundStyle(.purple); Text("reviewable").font(.caption).foregroundStyle(.secondary) }; Button(scan.developerAnalyzed ? "Refresh" : "Analyze") { scan.analyzeDeveloperStorage() }.disabled(scan.developerScanning || scan.cleanupBusy); Button("Clean This Up") { confirmCleanup=true }.buttonStyle(.borderedProminent).tint(.purple).disabled(scan.developerTargets.isEmpty || scan.developerScanning || scan.cleanupBusy) }.padding(18).background(Color.purple.opacity(0.08),in:RoundedRectangle(cornerRadius:14)).padding(.horizontal,24).confirmationDialog("Clean up \(format(total)) of developer storage?",isPresented:$confirmCleanup) { Button("Move \(scan.developerTargets.count) Folders to Trash",role:.destructive) { scan.trashDeveloperTargets(scan.developerTargets) }; Button("Cancel",role:.cancel) {} } message:{ Text("DiskSift will revalidate every supported folder and move it to Trash. Close Xcode and other developer tools first. You can restore these folders until you empty Trash.") }
             GroupBox { HStack { VStack(alignment:.leading,spacing:4) { Text("Unavailable simulator devices").font(.headline); Text("Runs Apple’s `xcrun simctl delete unavailable`. This does not touch active simulators, but this action is not recoverable from Trash.").font(.caption).foregroundStyle(.secondary) }; Spacer(); Button("Remove unavailable") { confirmSimulators=true }.disabled(scan.cleanupBusy) }.padding(8) } label:{ Label("Xcode-managed cleanup",systemImage:"iphone.and.arrow.forward") }.padding(.horizontal,24).confirmationDialog("Remove unavailable simulator devices?",isPresented:$confirmSimulators) { Button("Remove Unavailable Devices",role:.destructive) { scan.removeUnavailableSimulators() }; Button("Cancel",role:.cancel) {} } message:{ Text("Xcode will permanently remove simulator devices it marks unavailable. Active devices and runtimes are not targeted.") }
             if scan.developerScanning { VStack(spacing:10) { ProgressView(); Text("Measuring developer folders without blocking the app…").font(.caption).foregroundStyle(.secondary) }.frame(maxWidth:.infinity,maxHeight:.infinity) }
             else { List { ForEach(scan.developerTargets) { DeveloperTargetRow(target:$0) } }.overlay { if scan.developerAnalyzed && scan.developerTargets.isEmpty { EmptyState(title:"Developer storage looks clean",icon:"checkmark.seal",message:"No supported caches, DerivedData, or scanned node_modules folders were found.") } } }
