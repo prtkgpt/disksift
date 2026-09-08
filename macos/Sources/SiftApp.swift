@@ -22,6 +22,17 @@ struct FileItem: Identifiable, Hashable, Sendable {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return ["Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures"].contains { url.standardizedFileURL.path.hasPrefix(home.appendingPathComponent($0, isDirectory:true).path + "/") }
     }
+    var safeToDeleteReason: String? {
+        guard cleanupRestriction == nil else { return nil }
+        let downloads = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads",isDirectory:true).standardizedFileURL.path + "/"
+        let isOld = (modified ?? .now) < Calendar.current.date(byAdding:.day,value:-30,to:.now)!
+        guard url.standardizedFileURL.path.hasPrefix(downloads), isOld else { return nil }
+        switch url.pathExtension.lowercased() {
+        case "dmg": return "Old downloaded disk image. Removing it does not uninstall the app it contained."
+        case "pkg": return "Old downloaded installer package. Removing it does not uninstall installed software."
+        default: return nil
+        }
+    }
     var kind: String {
         let ext = url.pathExtension.lowercased()
         if ["jpg","jpeg","png","heic","gif","tiff","raw"].contains(ext) { return "Photos" }
@@ -44,6 +55,24 @@ struct CleanupReceipt: Identifiable {
     let movedBytes: Int64
     let failedCount: Int
     let completedAt: Date
+}
+
+enum FileSortOption: String, CaseIterable, Identifiable, Sendable {
+    case largest="Largest First", smallest="Smallest First", name="Name", type="Type", newest="Newest", oldest="Oldest"
+    var id:String { rawValue }
+    nonisolated func apply(to items:[FileItem]) -> [FileItem] {
+        switch self {
+        case .largest: return items.sorted { $0.bytes > $1.bytes }
+        case .smallest: return items.sorted { $0.bytes < $1.bytes }
+        case .name: return items.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        case .type: return items.sorted { lhs,rhs in
+            let left=lhs.url.pathExtension.lowercased(), right=rhs.url.pathExtension.lowercased()
+            return left == right ? lhs.bytes > rhs.bytes : left < right
+        }
+        case .newest: return items.sorted { ($0.modified ?? .distantPast) > ($1.modified ?? .distantPast) }
+        case .oldest: return items.sorted { ($0.modified ?? .distantFuture) < ($1.modified ?? .distantFuture) }
+        }
+    }
 }
 
 enum DeveloperCleanupKind: String, Hashable, Sendable { case derivedData, npmCache, gradleCache, homebrewCache, nodeModules }
@@ -145,6 +174,9 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     @Published var files: [FileItem] = []
     @Published private(set) var largestFiles: [FileItem] = []
     @Published private(set) var totalBytes: Int64 = 0
+    @Published private(set) var safeFiles: [FileItem] = []
+    @Published private(set) var oldFiles: [FileItem] = []
+    @Published private(set) var quickWins: [FileItem] = []
     @Published var scanning = false
     @Published var progress = 0.0
     @Published var scannedURL: URL?
@@ -168,6 +200,7 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     private var generation = UUID()
     private var categoryBytes: [String:Int64] = [:]
     private var categoryIndex: [String:[FileItem]] = [:]
+    private var duplicateCopyIDs: Set<UUID> = []
 
     func cancelWork() {
         scanTask?.cancel(); duplicateTask?.cancel(); developerTask?.cancel(); generation = UUID()
@@ -180,12 +213,11 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         return categoryBytes.map { CategoryTotal(name:$0.key,bytes:$0.value,color:colors[$0.key] ?? .gray) }.sorted { $0.bytes > $1.bytes }
     }
     var largeFiles: [FileItem] { largestFiles }
-    var oldFiles: [FileItem] { files.filter { ($0.modified ?? .now) < Calendar.current.date(byAdding: .year, value: -1, to: .now)! }.sorted { ($0.modified ?? .now) < ($1.modified ?? .now) } }
     var developerJunk: [FileItem] { files.filter { item in let p=item.url.path.lowercased(); return p.contains("/node_modules/") || p.contains("/deriveddata/") || p.contains("/.gradle/") || p.contains("/.npm/") || p.contains("/coresimulator/") }.sorted { $0.bytes > $1.bytes } }
-    var quickWins: [FileItem] { files.filter { item in let ext=item.url.pathExtension.lowercased(); let old=(item.modified ?? .now) < Calendar.current.date(byAdding:.day,value:-30,to:.now)!; return old && ["dmg","pkg","zip","iso"].contains(ext) }.sorted { $0.bytes > $1.bytes } }
     var filteredFiles: [FileItem] { searchText.isEmpty ? files : files.filter { $0.name.localizedCaseInsensitiveContains(searchText) || $0.url.path.localizedCaseInsensitiveContains(searchText) } }
     var selectedItems: [FileItem] { files.filter { selectedIDs.contains($0.id) } }
     var selectedBytes: Int64 { selectedItems.reduce(0) { $0 + $1.bytes } }
+    var selectedUnsafeCount: Int { selectedItems.filter { safetyReason(for:$0) == nil }.count }
     var safeQuickWins: [FileItem] { quickWins.filter { $0.cleanupRestriction == nil && $0.isPlanEligible } }
     var safeLargeFiles: [FileItem] { files.filter { $0.bytes >= 100_000_000 && $0.cleanupRestriction == nil && $0.isPlanEligible }.sorted { $0.bytes > $1.bytes } }
     var safeOldFiles: [FileItem] { oldFiles.filter { $0.cleanupRestriction == nil && $0.isPlanEligible } }
@@ -196,11 +228,23 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
 
     func categoryFiles(named category: String) -> [FileItem] { categoryIndex[category] ?? [] }
     func categoryTotal(named category: String) -> Int64 { categoryBytes[category] ?? 0 }
+    func safetyReason(for item: FileItem) -> String? {
+        item.safeToDeleteReason ?? (duplicateCopyIDs.contains(item.id) ? "Verified byte-for-byte duplicate with a recommended keeper." : nil)
+    }
+    var safeCleanupItems: [FileItem] {
+        var seen = Set<UUID>()
+        let duplicateCopies = duplicateGroups.flatMap { group in Array(group.sorted { Self.keeperScore($0) > Self.keeperScore($1) }.dropFirst()) }
+        return (safeFiles + duplicateCopies).filter { seen.insert($0.id).inserted }.sorted { $0.bytes > $1.bytes }
+    }
     func rebuildIndexes() {
-        categoryBytes = [:]; categoryIndex = [:]; totalBytes = 0
-        for item in files { totalBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item) }
+        categoryBytes = [:]; categoryIndex = [:]; totalBytes = 0; safeFiles = []; oldFiles = []; quickWins = []
+        let oldCutoff=Calendar.current.date(byAdding:.year,value:-1,to:.now)!, quickCutoff=Calendar.current.date(byAdding:.day,value:-30,to:.now)!
+        for item in files { totalBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item); if item.safeToDeleteReason != nil { safeFiles.append(item) }; if (item.modified ?? .now) < oldCutoff { oldFiles.append(item) }; if (item.modified ?? .now) < quickCutoff && ["dmg","pkg","zip","iso"].contains(item.url.pathExtension.lowercased()) { quickWins.append(item) } }
         for key in Array(categoryIndex.keys) { categoryIndex[key]?.sort { $0.bytes > $1.bytes } }
         largestFiles = Array(files.sorted { $0.bytes > $1.bytes }.prefix(100))
+        safeFiles.sort { $0.bytes > $1.bytes }
+        oldFiles.sort { ($0.modified ?? .now) < ($1.modified ?? .now) }
+        quickWins.sort { $0.bytes > $1.bytes }
     }
 
     func toggleSelection(_ item: FileItem) {
@@ -224,20 +268,31 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         cancelWork()
         let token = generation
         status = "Scanning file metadata in the background…"
-        scanning = true; progress = 0; error = nil; files = []; largestFiles = []; totalBytes = 0; categoryBytes = [:]; categoryIndex = [:]; selectedIDs = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; developerTargets = []; developerAnalyzed = false; scannedURL = url
+        scanning = true; progress = 0; error = nil; files = []; largestFiles = []; totalBytes = 0; safeFiles = []; oldFiles = []; quickWins = []; categoryBytes = [:]; categoryIndex = [:]; duplicateCopyIDs = []; selectedIDs = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; developerTargets = []; developerAnalyzed = false; scannedURL = url
+        let oldCutoff=Calendar.current.date(byAdding:.year,value:-1,to:.now)!, quickCutoff=Calendar.current.date(byAdding:.day,value:-30,to:.now)!
         scanTask = Task {
             for await batch in Self.fileBatches(at: url) {
                 guard !Task.isCancelled, generation == token else { return }
-                for item in batch { totalBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item) }
+                for item in batch { totalBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item); if item.safeToDeleteReason != nil { safeFiles.append(item) }; if (item.modified ?? .now) < oldCutoff { oldFiles.append(item) }; if (item.modified ?? .now) < quickCutoff && ["dmg","pkg","zip","iso"].contains(item.url.pathExtension.lowercased()) { quickWins.append(item) } }
                 largestFiles = Array((largestFiles + batch).sorted { $0.bytes > $1.bytes }.prefix(100))
                 files.append(contentsOf: batch)
                 progress = Double(files.count)
                 status = "Scanning… \(files.count.formatted()) files found. Results are ready to review as they appear."
             }
             guard !Task.isCancelled, generation == token else { return }
-            files.sort { $0.bytes > $1.bytes }
-            for key in Array(categoryIndex.keys) { categoryIndex[key]?.sort { $0.bytes > $1.bytes } }
-            largestFiles = Array(files.prefix(100)); scanning = false
+            status = "Organizing results by size in the background…"
+            let snapshot=files
+            let organized=await Task.detached(priority:.userInitiated) { () -> ([FileItem],[String:[FileItem]],[FileItem],[FileItem],[FileItem]) in
+                let sorted=snapshot.sorted { $0.bytes > $1.bytes }
+                let grouped=Dictionary(grouping:sorted,by:\.kind)
+                let safe=sorted.filter { $0.safeToDeleteReason != nil }
+                let old=sorted.filter { ($0.modified ?? .now) < oldCutoff }.sorted { ($0.modified ?? .now) < ($1.modified ?? .now) }
+                let quick=sorted.filter { ($0.modified ?? .now) < quickCutoff && ["dmg","pkg","zip","iso"].contains($0.url.pathExtension.lowercased()) }
+                return (sorted,grouped,safe,old,quick)
+            }.value
+            guard !Task.isCancelled, generation == token else { return }
+            files=organized.0; categoryIndex=organized.1; safeFiles=organized.2; oldFiles=organized.3; quickWins=organized.4
+            largestFiles=Array(files.prefix(100)); scanning=false
             status = "Scan complete. Build a Cleanup Plan or start with old installers in Quick Wins."
         }
     }
@@ -245,13 +300,14 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         guard !duplicateScanning && !scanning && !cleanupBusy else { return }
         let token = generation
         let snapshot = files
-        duplicateScanning = true; duplicatesAnalyzed = false; duplicateGroups = []
+        duplicateScanning = true; duplicatesAnalyzed = false; duplicateGroups = []; duplicateCopyIDs = []
         duplicateTask = Task.detached(priority: .utility) {
             let duplicates = Self.findDuplicates(in: snapshot)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard self.generation == token else { return }
                 self.duplicateGroups = duplicates
+                self.duplicateCopyIDs = Set(duplicates.flatMap { group in group.sorted { Self.keeperScore($0) > Self.keeperScore($1) }.dropFirst().map(\.id) })
                 self.duplicateScanning = false
                 self.duplicatesAnalyzed = true
             }
@@ -393,7 +449,7 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
                     self.files.removeAll { $0.id == item.id }
                     self.rebuildIndexes()
                     self.selectedIDs.remove(item.id)
-                    self.duplicateGroups = []; self.duplicatesAnalyzed = false
+                    self.duplicateGroups = []; self.duplicateCopyIDs = []; self.duplicatesAnalyzed = false
                     self.cleanupReceipt = CleanupReceipt(movedCount: 1, movedBytes: item.bytes, failedCount: 0, completedAt: .now)
                     self.showingCleanupReceipt = true
                     self.status = "Moved to Trash. Restore from Finder if needed. Disk space is released after Trash is emptied."
@@ -422,7 +478,7 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
                 self.files.removeAll { movedIDs.contains($0.id) }
                 self.rebuildIndexes()
                 self.selectedIDs.subtract(movedIDs)
-                self.cleanupBusy = false; self.duplicateGroups = []; self.duplicatesAnalyzed = false
+                self.cleanupBusy = false; self.duplicateGroups = []; self.duplicateCopyIDs = []; self.duplicatesAnalyzed = false
                 self.cleanupReceipt = CleanupReceipt(movedCount: movedIDs.count, movedBytes: movedBytes, failedCount: failed, completedAt: .now)
                 self.showingCleanupReceipt = true
                 self.status = failed == 0 ? "Cleanup complete. Items are recoverable from Trash." : "Cleanup finished. \(failed) item(s) were left in place because macOS did not allow access."
@@ -524,7 +580,7 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     }
 }
 
-enum SidebarSection: String, CaseIterable { case overview="Overview", cleanup="Cleanup Plan", quick="Quick Wins", all="All Files", large="Large Files", old="Old Files", duplicates="Exact Duplicates", developer="Developer Junk"; var icon:String { ["Overview":"chart.pie.fill","Cleanup Plan":"checklist","Quick Wins":"bolt.fill","All Files":"list.bullet.rectangle","Large Files":"doc.text.magnifyingglass","Old Files":"clock.arrow.circlepath","Exact Duplicates":"square.on.square","Developer Junk":"hammer"][rawValue]! }; var isPro:Bool { self == .cleanup || self == .duplicates || self == .developer } }
+enum SidebarSection: String, CaseIterable { case overview="Overview", safe="Safe to Delete", cleanup="Cleanup Plan", quick="Quick Wins", all="All Files", large="Large Files", old="Old Files", duplicates="Exact Duplicates", developer="Developer Junk"; var icon:String { ["Overview":"chart.pie.fill","Safe to Delete":"checkmark.shield.fill","Cleanup Plan":"checklist","Quick Wins":"bolt.fill","All Files":"list.bullet.rectangle","Large Files":"doc.text.magnifyingglass","Old Files":"clock.arrow.circlepath","Exact Duplicates":"square.on.square","Developer Junk":"hammer"][rawValue]! }; var isPro:Bool { self == .cleanup || self == .duplicates || self == .developer } }
 
 struct ContentView: View {
     @EnvironmentObject var scan: ScanModel; @EnvironmentObject var license: LicenseManager
@@ -552,7 +608,7 @@ struct ContentView: View {
     }
     @ViewBuilder var detail: some View {
         if scan.scannedURL == nil { WelcomeView() }
-        else { VStack(spacing: 0) { header; if scan.scanning || scan.duplicateScanning { HStack { ProgressView().controlSize(.small); Text(scan.scanning ? "\(scan.files.count.formatted()) files found" : "Verifying duplicates"); Spacer(); Button("Stop") { scan.cancelWork() } }.padding(.horizontal, 28) }; Text(scan.status).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 28); Group { switch section { case .overview: OverviewView(); case .cleanup: CleanupPlanView(); case .quick: QuickWinsView(); case .all: AllFilesView(); case .large: LargeFilesView(); case .old: OldFilesView(); case .duplicates: DuplicatesView(); case .developer: DeveloperJunkView() } }; if license.isPro && !scan.selectedIDs.isEmpty { HStack { VStack(alignment:.leading) { Text("\(scan.selectedIDs.count) selected").font(.headline); Text("\(format(scan.selectedBytes)) will move to Trash").font(.caption).foregroundStyle(.secondary) }; Spacer(); Button("Clear") { scan.clearSelection() }; Button("Clean This Up") { confirmBatch = true }.buttonStyle(.borderedProminent).tint(.purple).disabled(scan.cleanupBusy || scan.scanning) }.padding(14).background(.bar).confirmationDialog("Move \(scan.selectedIDs.count) items to Trash?", isPresented: $confirmBatch) { Button("Move \(scan.selectedIDs.count) Items to Trash", role:.destructive) { scan.trashSelected() }; Button("Cancel", role:.cancel) {} } message: { Text("DiskSift will leave protected or inaccessible items untouched. You can restore moved items until you empty Trash.") } } }.environmentObject(scan).environmentObject(license) }
+        else { VStack(spacing: 0) { header; if scan.scanning || scan.duplicateScanning { HStack { ProgressView().controlSize(.small); Text(scan.scanning ? "\(scan.files.count.formatted()) files found" : "Verifying duplicates"); Spacer(); Button("Stop") { scan.cancelWork() } }.padding(.horizontal, 28) }; Text(scan.status).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 28); Group { switch section { case .overview: OverviewView(); case .safe: SafeToDeleteView(); case .cleanup: CleanupPlanView(); case .quick: QuickWinsView(); case .all: AllFilesView(); case .large: LargeFilesView(); case .old: OldFilesView(); case .duplicates: DuplicatesView(); case .developer: DeveloperJunkView() } }; if license.isPro && !scan.selectedIDs.isEmpty { HStack { VStack(alignment:.leading) { Text("\(scan.selectedIDs.count) selected").font(.headline); Text("\(format(scan.selectedBytes)) will move to Trash").font(.caption).foregroundStyle(.secondary); if scan.selectedUnsafeCount > 0 { Text("\(scan.selectedUnsafeCount) selected item(s) are not marked Safe to Delete").font(.caption.bold()).foregroundStyle(.orange) } }; Spacer(); Button("Clear") { scan.clearSelection() }; Button("Clean This Up") { confirmBatch = true }.buttonStyle(.borderedProminent).tint(.purple).disabled(scan.cleanupBusy || scan.scanning) }.padding(14).background(.bar).confirmationDialog("Move \(scan.selectedIDs.count) items to Trash?", isPresented: $confirmBatch) { Button("Move \(scan.selectedIDs.count) Items to Trash", role:.destructive) { scan.trashSelected() }; Button("Cancel", role:.cancel) {} } message: { Text(scan.selectedUnsafeCount == 0 ? "Every selected item is marked Safe to Delete. DiskSift will revalidate them and move them to Trash." : "Some selected items are not marked Safe to Delete. Confirm you recognize them before continuing. DiskSift will leave protected locations untouched, and moved items remain recoverable until Trash is emptied.") } } }.environmentObject(scan).environmentObject(license) }
     }
     var header: some View { HStack { VStack(alignment: .leading) { Text(section.rawValue).font(.title.bold()); Text(scan.scannedURL?.path(percentEncoded: false) ?? "").lineLimit(1).font(.caption).foregroundStyle(.secondary) }; Spacer(); TextField("Search files and folders", text:$scan.searchText).textFieldStyle(.roundedBorder).frame(maxWidth:260); Button { scan.chooseFolder() } label: { Label("Scan", systemImage: "folder.badge.gearshape") }.buttonStyle(.borderedProminent).tint(.purple) }.padding(24) }
 }
@@ -584,6 +640,9 @@ struct CategoryFilesView: View {
     let category:String
     let onBack:()->Void
     @State private var limit=500
+    @State private var sort:FileSortOption = .largest
+    @State private var sortedItems:[FileItem] = []
+    @State private var sorting=true
     var items:[FileItem] { scan.categoryFiles(named:category) }
     var body:some View {
         VStack(spacing:0) {
@@ -591,19 +650,40 @@ struct CategoryFilesView: View {
                 Button(action:onBack) { Label("Categories",systemImage:"chevron.left") }
                 VStack(alignment:.leading,spacing:3) { Text(category).font(.title2.bold()); Text("\(items.count.formatted()) files · \(format(scan.categoryTotal(named:category)))").font(.caption).foregroundStyle(.secondary) }
                 Spacer()
-                if license.isPro { Button("Select All") { scan.select(items) }.disabled(items.isEmpty || scan.scanning); Button("Clear") { scan.clearSelection() }.disabled(scan.selectedIDs.isEmpty) }
+                HStack(spacing:6) { Text("Sort by").font(.caption).foregroundStyle(.secondary); Picker("Sort by",selection:$sort) { ForEach(FileSortOption.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.menu).frame(width:150) }
+                if license.isPro { Menu("Select") { Button("Safe to Delete") { scan.select(items.filter { scan.safetyReason(for:$0) != nil }) }; Button("All in Category") { scan.select(items) } }.disabled(items.isEmpty || scan.scanning); Button("Clear") { scan.clearSelection() }.disabled(scan.selectedIDs.isEmpty) }
                 else { Button("Unlock cleanup") { license.showingLicense=true }.buttonStyle(.borderedProminent).tint(.purple) }
             }.padding(.horizontal,24).padding(.bottom,12)
-            if scan.scanning { Text("Results update while scanning. Select All becomes available when the scan finishes.").font(.caption).foregroundStyle(.secondary).padding(.bottom,8) }
+            if scan.scanning { Text("Showing a sorted snapshot. The list refreshes and Select becomes available when the scan finishes.").font(.caption).foregroundStyle(.secondary).padding(.bottom,8) }
             List {
-                ForEach(items.prefix(limit)) { FileRow(item:$0,canTrash:true) }
-                if items.count > limit { Button("Load \(min(500,items.count-limit)) more") { limit += 500 }.frame(maxWidth:.infinity).padding(8) }
-            }.overlay { if items.isEmpty { EmptyState(title:"No \(category.lowercased()) found",icon:"tray",message:"This category has no files in the current scan.") } }
+                ForEach(sortedItems.prefix(limit)) { FileRow(item:$0,canTrash:true) }
+                if sortedItems.count > limit { Button("Load \(min(500,sortedItems.count-limit)) more") { limit += 500 }.frame(maxWidth:.infinity).padding(8) }
+            }.overlay { if sorting { VStack(spacing:10) { ProgressView(); Text("Sorting \(items.count.formatted()) files…").font(.caption).foregroundStyle(.secondary) } } else if sortedItems.isEmpty { EmptyState(title:"No \(category.lowercased()) found",icon:"tray",message:"This category has no files in the current scan.") } }
+        }.task(id:"\(category)|\(sort.rawValue)|\(scan.scanning)") {
+            sorting=true; limit=500
+            let snapshot=items, option=sort
+            let result=await Task.detached(priority:.userInitiated) { option.apply(to:snapshot) }.value
+            guard !Task.isCancelled else { return }
+            sortedItems=result; sorting=false
         }
     }
 }
 
 struct EmptyState: View { let title:String, icon:String, message:String; var body: some View { VStack(spacing:12){Image(systemName:icon).font(.system(size:38)).foregroundStyle(.secondary);Text(title).font(.headline);Text(message).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)}.frame(maxWidth:420).padding(30) } }
+struct SafeToDeleteView: View {
+    @EnvironmentObject var scan:ScanModel
+    @EnvironmentObject var license:LicenseManager
+    @State private var sort:FileSortOption = .largest
+    var items:[FileItem] { sort.apply(to:scan.safeCleanupItems) }
+    var total:Int64 { items.reduce(0) { $0 + $1.bytes } }
+    var body:some View {
+        VStack(spacing:0) {
+            HStack { VStack(alignment:.leading,spacing:4) { Label("Conservative recommendations",systemImage:"checkmark.shield.fill").font(.title2.bold()).foregroundStyle(.green); Text("Only items DiskSift can explain and revalidate are included.").foregroundStyle(.secondary) }; Spacer(); VStack(alignment:.trailing) { Text(format(total)).font(.title2.bold()).foregroundStyle(.purple); Text("\(items.count.formatted()) safe item(s)").font(.caption).foregroundStyle(.secondary) }; Picker("Sort",selection:$sort) { ForEach(FileSortOption.allCases) { Text($0.rawValue).tag($0) } }.pickerStyle(.menu).frame(width:150); if license.isPro { Button("Select All Safe") { scan.select(items) }.disabled(items.isEmpty || scan.scanning) } else { Button("Unlock batch cleanup") { license.showingLicense=true }.buttonStyle(.borderedProminent).tint(.purple) } }.padding(18).background(Color.green.opacity(0.08),in:RoundedRectangle(cornerRadius:14)).padding(.horizontal,24)
+            Text("Old DMG and PKG installer copies in Downloads qualify after 30 days. Verified duplicate copies appear after Exact Duplicates finishes. Personal documents and media are never assumed safe.").font(.caption).foregroundStyle(.secondary).padding(.horizontal,24).padding(.vertical,10)
+            List { ForEach(items) { FileRow(item:$0,canTrash:true,badge:"SAFE") } }.overlay { if items.isEmpty { EmptyState(title:"No safe recommendations yet",icon:"checkmark.shield",message:"Finish the scan, or run Exact Duplicates. DiskSift will not guess when a file may be important.") } }
+        }
+    }
+}
 struct CleanupPlanView: View {
     @EnvironmentObject var scan: ScanModel
     var candidateBytes: Int64 { scan.cleanupCandidates.reduce(0) { $0 + $1.bytes } }
@@ -630,10 +710,34 @@ struct CleanupBucket: View {
     var bytes:Int64 { items.reduce(0) { $0 + $1.bytes } }
     var body: some View { GroupBox { HStack { VStack(alignment:.leading,spacing:4) { Text("\(items.count.formatted()) candidates · \(format(bytes))").font(.headline); Text(detail).font(.caption).foregroundStyle(.secondary) }; Spacer(); Button("Select for review") { scan.select(items) }.disabled(items.isEmpty || scan.scanning) }.padding(8) } label: { Label(title,systemImage:icon) } }
 }
-struct QuickWinsView: View { @EnvironmentObject var scan:ScanModel; var reclaimable:Int64 { scan.safeQuickWins.reduce(0){$0+$1.bytes} }; var body:some View { VStack(spacing:0) { HStack { VStack(alignment:.leading,spacing:5){Text("Safe place to start").font(.title2.bold());Text("Old installers and archives are usually easy to review and replace.").foregroundStyle(.secondary)};Spacer();VStack(alignment:.trailing){Text(format(reclaimable)).font(.title2.bold()).foregroundStyle(.purple);Text("reviewable space").font(.caption).foregroundStyle(.secondary)}}.padding(20).background(Color.purple.opacity(0.08),in:RoundedRectangle(cornerRadius:14)).padding(.horizontal,24);List { ForEach(scan.quickWins) { FileRow(item:$0,canTrash:true) } }.overlay { if scan.quickWins.isEmpty { EmptyState(title:"No obvious quick wins",icon:"checkmark.seal",message:"No installers or archives older than 30 days were found in this scan.") } } } } }
-struct AllFilesView: View { @EnvironmentObject var scan:ScanModel; var body:some View { List(scan.filteredFiles) { FileRow(item:$0,canTrash:true) }.overlay { if scan.filteredFiles.isEmpty { EmptyState(title:"No matching files",icon:"magnifyingglass",message:"Try a different search or folder.") } } } }
-struct LargeFilesView: View { @EnvironmentObject var scan: ScanModel; var body: some View { List { ForEach(scan.largeFiles.filter{$0.bytes >= 100_000_000}.prefix(100)) { FileRow(item: $0, canTrash: true) } }.overlay { if scan.files.isEmpty { EmptyState(title:"No files found",icon:"doc",message:"Choose another folder to scan.") } } } }
-struct OldFilesView: View { @EnvironmentObject var scan:ScanModel; var body:some View { List { ForEach(scan.oldFiles.prefix(250)) { FileRow(item:$0,canTrash:true) } }.overlay { if scan.oldFiles.isEmpty { EmptyState(title:"Nothing old found",icon:"clock",message:"No files in this scan are older than one year.") } } } }
+struct QuickWinsView: View { @EnvironmentObject var scan:ScanModel; @State private var sort:FileSortOption = .largest; var reclaimable:Int64 { scan.safeQuickWins.reduce(0){$0+$1.bytes} }; var body:some View { VStack(spacing:0) { HStack { VStack(alignment:.leading,spacing:5){Text("Low-risk place to start").font(.title2.bold());Text("Review old installers and archives before removing them.").foregroundStyle(.secondary)};Spacer();VStack(alignment:.trailing){Text(format(reclaimable)).font(.title2.bold()).foregroundStyle(.purple);Text("reviewable space").font(.caption).foregroundStyle(.secondary)};Picker("Sort",selection:$sort){ForEach(FileSortOption.allCases){Text($0.rawValue).tag($0)}}.pickerStyle(.menu).frame(width:150)}.padding(20).background(Color.purple.opacity(0.08),in:RoundedRectangle(cornerRadius:14)).padding(.horizontal,24);List { ForEach(sort.apply(to:scan.quickWins)) { FileRow(item:$0,canTrash:true) } }.overlay { if scan.quickWins.isEmpty { EmptyState(title:"No obvious quick wins",icon:"checkmark.seal",message:"No installers or archives older than 30 days were found in this scan.") } } } } }
+
+struct SortableFileList: View {
+    @EnvironmentObject var scan:ScanModel
+    let items:[FileItem]
+    let emptyTitle:String
+    let emptyIcon:String
+    let emptyMessage:String
+    @State private var sort:FileSortOption = .largest
+    @State private var sortedItems:[FileItem] = []
+    @State private var sorting=true
+    @State private var limit=500
+    var body:some View {
+        VStack(spacing:0) {
+            HStack { Text("\(items.count.formatted()) results").font(.caption).foregroundStyle(.secondary); Spacer(); Text("Sort by").font(.caption).foregroundStyle(.secondary); Picker("Sort by",selection:$sort){ForEach(FileSortOption.allCases){Text($0.rawValue).tag($0)}}.pickerStyle(.menu).frame(width:150) }.padding(.horizontal,24).padding(.bottom,8)
+            List { ForEach(sortedItems.prefix(limit)) { FileRow(item:$0,canTrash:true) }; if sortedItems.count > limit { Button("Load \(min(500,sortedItems.count-limit)) more") { limit += 500 }.frame(maxWidth:.infinity).padding(8) } }.overlay { if sorting { ProgressView("Sorting…") } else if sortedItems.isEmpty { EmptyState(title:emptyTitle,icon:emptyIcon,message:emptyMessage) } }
+        }.task(id:"\(sort.rawValue)|\(scan.scanning)|\(scan.searchText)") {
+            sorting=true; limit=500
+            let snapshot=items, option=sort
+            let result=await Task.detached(priority:.userInitiated) { option.apply(to:snapshot) }.value
+            guard !Task.isCancelled else { return }
+            sortedItems=result; sorting=false
+        }
+    }
+}
+struct AllFilesView: View { @EnvironmentObject var scan:ScanModel; var body:some View { SortableFileList(items:scan.filteredFiles,emptyTitle:"No matching files",emptyIcon:"magnifyingglass",emptyMessage:"Try a different search or folder.") } }
+struct LargeFilesView: View { @EnvironmentObject var scan:ScanModel; var body:some View { SortableFileList(items:Array(scan.largeFiles.filter{$0.bytes >= 100_000_000}),emptyTitle:"No large files found",emptyIcon:"doc",emptyMessage:"No files of at least 100 MB were found in this scan.") } }
+struct OldFilesView: View { @EnvironmentObject var scan:ScanModel; var body:some View { SortableFileList(items:scan.oldFiles,emptyTitle:"Nothing old found",emptyIcon:"clock",emptyMessage:"No files in this scan are older than one year.") } }
 struct DuplicatesView: View {
     @EnvironmentObject var scan: ScanModel
     var body: some View {
@@ -695,7 +799,27 @@ struct DeveloperTargetRow: View {
     var body:some View { HStack(spacing:12) { Image(systemName:"folder.badge.gearshape").foregroundStyle(.purple); VStack(alignment:.leading,spacing:3) { Text(target.title).font(.headline); Text(target.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2); Text(target.url.path(percentEncoded:false)).font(.caption2).foregroundStyle(.tertiary).lineLimit(1) }; Spacer(); Text(format(target.bytes)).font(.caption.monospacedDigit()); Button { NSWorkspace.shared.activateFileViewerSelecting([target.url]) } label:{ Image(systemName:"folder") }.buttonStyle(.borderless).help("Reveal in Finder"); Button("Move to Trash") { confirm=true }.disabled(scan.cleanupBusy).confirmationDialog("Move \(target.title) to Trash?",isPresented:$confirm) { Button("Move Folder to Trash",role:.destructive) { scan.trashDeveloperTarget(target) }; Button("Cancel",role:.cancel) {} } message:{ Text("\(target.detail) The complete folder will be recoverable until you empty Trash.") } }.padding(.vertical,5) }
 }
 struct Metric: View { let title:String,value:String,icon:String; var body: some View { VStack(alignment:.leading,spacing:8){Image(systemName:icon).foregroundStyle(.purple);Text(value).font(.title2.bold());Text(title).font(.caption).foregroundStyle(.secondary)}.frame(maxWidth:.infinity,alignment:.leading).padding(16).background(Color(nsColor:.controlBackgroundColor),in:RoundedRectangle(cornerRadius:12)) } }
-struct FileRow: View { @EnvironmentObject var scan: ScanModel; @EnvironmentObject var license:LicenseManager; let item:FileItem; var canTrash=false; var badge:String?=nil; @State private var confirmTrash = false; var body: some View { HStack { if canTrash && license.isPro && item.cleanupRestriction == nil { Button { scan.toggleSelection(item) } label:{Image(systemName:scan.selectedIDs.contains(item.id) ? "checkmark.square.fill" : "square").foregroundStyle(scan.selectedIDs.contains(item.id) ? .purple : .secondary)}.buttonStyle(.borderless).disabled(scan.scanning || scan.duplicateScanning || scan.cleanupBusy).help("Select for cleanup") };Image(systemName:"doc.fill").foregroundStyle(.purple.opacity(0.75));VStack(alignment:.leading){HStack { Text(item.name).lineLimit(1); if let badge { Text(badge).font(.caption2.bold()).foregroundStyle(.green).padding(.horizontal,5).background(Color.green.opacity(0.12),in:Capsule()) } };Text(item.url.deletingLastPathComponent().path(percentEncoded:false)).font(.caption2).foregroundStyle(.secondary).lineLimit(1)};Spacer();Text(format(item.bytes)).font(.caption.monospacedDigit());Button { NSWorkspace.shared.open(item.url) } label:{Image(systemName:"eye")}.buttonStyle(.borderless).help("Open file");Button { NSWorkspace.shared.activateFileViewerSelecting([item.url]) } label:{Image(systemName:"folder")}.buttonStyle(.borderless).help("Reveal in Finder");if canTrash { Button { if let reason = item.cleanupRestriction { scan.error = reason } else { confirmTrash = true } } label:{Image(systemName: item.cleanupRestriction == nil ? "trash" : "info.circle")}.buttonStyle(.borderless).disabled(scan.scanning || scan.duplicateScanning || scan.cleanupBusy).help(item.cleanupRestriction ?? "Review and move to Trash").confirmationDialog("Move \(item.name) to Trash?", isPresented: $confirmTrash) { Button("Move to Trash", role: .destructive) { scan.trash(item) }; Button("Cancel", role: .cancel) {} } message: { Text("Confirm you no longer need this file. You can restore it from Trash until Trash is emptied.") } } }.padding(.vertical,4) } }
+struct FileRow: View {
+    @EnvironmentObject var scan:ScanModel
+    @EnvironmentObject var license:LicenseManager
+    let item:FileItem
+    var canTrash=false
+    var badge:String?=nil
+    @State private var confirmTrash=false
+    var safetyReason:String? { scan.safetyReason(for:item) }
+    var displayBadge:String? { badge ?? (safetyReason == nil ? nil : "SAFE") }
+    var body:some View {
+        HStack {
+            if canTrash && license.isPro && item.cleanupRestriction == nil { Button { scan.toggleSelection(item) } label:{ Image(systemName:scan.selectedIDs.contains(item.id) ? "checkmark.square.fill" : "square").foregroundStyle(scan.selectedIDs.contains(item.id) ? .purple : .secondary) }.buttonStyle(.borderless).disabled(scan.scanning || scan.duplicateScanning || scan.cleanupBusy).help("Select for cleanup") }
+            Image(systemName:"doc.fill").foregroundStyle(.purple.opacity(0.75))
+            VStack(alignment:.leading) { HStack { Text(item.name).lineLimit(1); if let displayBadge { Text(displayBadge).font(.caption2.bold()).foregroundStyle(.green).padding(.horizontal,5).background(Color.green.opacity(0.12),in:Capsule()) } }; Text(item.url.deletingLastPathComponent().path(percentEncoded:false)).font(.caption2).foregroundStyle(.secondary).lineLimit(1); if let safetyReason { Text(safetyReason).font(.caption2).foregroundStyle(.green).lineLimit(1) } }
+            Spacer(); Text(format(item.bytes)).font(.caption.monospacedDigit())
+            Button { NSWorkspace.shared.open(item.url) } label:{ Image(systemName:"eye") }.buttonStyle(.borderless).help("Open file")
+            Button { NSWorkspace.shared.activateFileViewerSelecting([item.url]) } label:{ Image(systemName:"folder") }.buttonStyle(.borderless).help("Reveal in Finder")
+            if canTrash { Button { if let reason=item.cleanupRestriction { scan.error=reason } else { confirmTrash=true } } label:{ Image(systemName:item.cleanupRestriction == nil ? "trash" : "info.circle") }.buttonStyle(.borderless).disabled(scan.scanning || scan.duplicateScanning || scan.cleanupBusy).help(item.cleanupRestriction ?? "Review and move to Trash").confirmationDialog("Move \(item.name) to Trash?",isPresented:$confirmTrash) { Button("Move to Trash",role:.destructive) { scan.trash(item) }; Button("Cancel",role:.cancel) {} } message:{ Text(safetyReason.map { "Safe to Delete: \($0) DiskSift will revalidate the file and move it to Trash." } ?? "DiskSift has not marked this file Safe to Delete. Confirm that you recognize it and no longer need it. It remains recoverable until Trash is emptied.") } }
+        }.padding(.vertical,4)
+    }
+}
 
 struct CleanupReceiptView: View {
     @Environment(\.dismiss) var dismiss
