@@ -20,7 +20,7 @@ export default function MarkdownArticle({ source }: { source: string }) {
     if (!line) { index++; continue; }
     if (line.startsWith("### ")) nodes.push(<h3 key={index}>{inline(line.slice(4))}</h3>);
     else if (line.startsWith("## ")) nodes.push(<h2 key={index}>{inline(line.slice(3))}</h2>);
-    else if (line.startsWith("# ")) nodes.push(<h1 key={index}>{inline(line.slice(2))}</h1>);
+    else if (line.startsWith("# ")) nodes.push(<h2 key={index}>{inline(line.slice(2))}</h2>);
     else if (line.startsWith("- ")) {
       const items = []; const start = index;
       while (index < lines.length && lines[index].trim().startsWith("- ")) { items.push(lines[index].trim().slice(2)); index++; }

@@ -29,3 +29,4 @@ macos/Assets/Sift.iconset
 # local repository metadata
 .git
 .disksift-git
+.vercel

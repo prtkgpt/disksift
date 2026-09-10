@@ -31,3 +31,16 @@ export async function getPublishedPost(slug: string): Promise<PublicPost | null>
     return null;
   }
 }
+
+export async function getRelatedPosts(category: string, excludeSlug: string, limit = 3): Promise<PublicPost[]> {
+  if (!hasDatabase()) return [];
+  try {
+    return await prisma.blogPost.findMany({
+      where: { status:"PUBLISHED", publishedAt:{ lte:new Date() }, category, slug:{ not:excludeSlug } },
+      orderBy: { publishedAt:"desc" }, take:limit,
+    }) as PublicPost[];
+  } catch (error) {
+    console.error("Could not load related blog posts", error);
+    return [];
+  }
+}
