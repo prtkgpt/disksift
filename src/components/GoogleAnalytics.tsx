@@ -8,7 +8,9 @@ const MEASUREMENT_ID = "G-T9FYMETSD4";
 export default function GoogleAnalytics() {
   const pathname = usePathname();
   const isSensitivePage =
-    pathname.startsWith("/purchase") || pathname.startsWith("/blog/admin");
+    pathname.startsWith("/purchase") ||
+    pathname.startsWith("/blog/admin") ||
+    pathname === "/civicsprep-privacy-policy";
 
   if (isSensitivePage) return null;
 
