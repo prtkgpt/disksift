@@ -57,6 +57,20 @@ struct CleanupReceipt: Identifiable {
     let completedAt: Date
 }
 
+private struct ScanCollections: Sendable {
+    let files: [FileItem]
+    let largestFiles: [FileItem]
+    let totalBytes: Int64
+    let safeFiles: [FileItem]
+    let oldFiles: [FileItem]
+    let quickWins: [FileItem]
+    let planLargeFiles: [FileItem]
+    let planOldFiles: [FileItem]
+    let planQuickWins: [FileItem]
+    let categoryBytes: [String:Int64]
+    let categoryIndex: [String:[FileItem]]
+}
+
 enum FileSortOption: String, CaseIterable, Identifiable, Sendable {
     case largest="Largest First", smallest="Smallest First", name="Name", type="Type", newest="Newest", oldest="Oldest"
     var id:String { rawValue }
@@ -193,6 +207,8 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     @Published var developerAnalyzed = false
     @Published var searchText = ""
     @Published var cleanupBusy = false
+    @Published private(set) var cleanupCompleted = 0
+    @Published private(set) var cleanupTotal = 0
     @Published var status = ""
     @Published var selectedIDs: Set<UUID> = []
     @Published var cleanupReceipt: CleanupReceipt?
@@ -204,6 +220,7 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     private var categoryBytes: [String:Int64] = [:]
     private var categoryIndex: [String:[FileItem]] = [:]
     private var duplicateCopyIDs: Set<UUID> = []
+    private var selectedItemIndex: [UUID:FileItem] = [:]
 
     func cancelWork() {
         scanTask?.cancel(); duplicateTask?.cancel(); developerTask?.cancel(); generation = UUID()
@@ -218,7 +235,7 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     var largeFiles: [FileItem] { largestFiles }
     var developerJunk: [FileItem] { files.filter { item in let p=item.url.path.lowercased(); return p.contains("/node_modules/") || p.contains("/deriveddata/") || p.contains("/.gradle/") || p.contains("/.npm/") || p.contains("/coresimulator/") }.sorted { $0.bytes > $1.bytes } }
     var filteredFiles: [FileItem] { searchText.isEmpty ? files : files.filter { $0.name.localizedCaseInsensitiveContains(searchText) || $0.url.path.localizedCaseInsensitiveContains(searchText) } }
-    var selectedItems: [FileItem] { files.filter { selectedIDs.contains($0.id) } }
+    var selectedItems: [FileItem] { Array(selectedItemIndex.values) }
     var selectedBytes: Int64 { selectedItems.reduce(0) { $0 + $1.bytes } }
     var selectedUnsafeCount: Int { selectedItems.filter { safetyReason(for:$0) == nil }.count }
     var safeQuickWins: [FileItem] { planQuickWins }
@@ -239,32 +256,17 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         let duplicateCopies = duplicateGroups.flatMap { group in Array(group.sorted { Self.keeperScore($0) > Self.keeperScore($1) }.dropFirst()) }
         return (safeFiles + duplicateCopies).filter { seen.insert($0.id).inserted }.sorted { $0.bytes > $1.bytes }
     }
-    func rebuildIndexes() {
-        categoryBytes = [:]; categoryIndex = [:]; totalBytes = 0; safeFiles = []; oldFiles = []; quickWins = []; planLargeFiles = []; planOldFiles = []; planQuickWins = []
-        let oldCutoff=Calendar.current.date(byAdding:.year,value:-1,to:.now)!, quickCutoff=Calendar.current.date(byAdding:.day,value:-30,to:.now)!
-        for item in files {
-            totalBytes += item.bytes; categoryBytes[item.kind,default:0] += item.bytes; categoryIndex[item.kind,default:[]].append(item)
-            if item.safeToDeleteReason != nil { safeFiles.append(item) }
-            if (item.modified ?? .now) < oldCutoff { oldFiles.append(item); if item.cleanupRestriction == nil && item.isPlanEligible { planOldFiles.append(item) } }
-            if (item.modified ?? .now) < quickCutoff && ["dmg","pkg","zip","iso"].contains(item.url.pathExtension.lowercased()) { quickWins.append(item); if item.cleanupRestriction == nil && item.isPlanEligible { planQuickWins.append(item) } }
-            if item.bytes >= 100_000_000 && item.cleanupRestriction == nil && item.isPlanEligible { planLargeFiles.append(item) }
-        }
-        for key in Array(categoryIndex.keys) { categoryIndex[key]?.sort { $0.bytes > $1.bytes } }
-        largestFiles = Array(files.sorted { $0.bytes > $1.bytes }.prefix(100))
-        safeFiles.sort { $0.bytes > $1.bytes }
-        oldFiles.sort { ($0.modified ?? .now) < ($1.modified ?? .now) }
-        quickWins.sort { $0.bytes > $1.bytes }
-        planLargeFiles.sort { $0.bytes > $1.bytes }
-        planOldFiles.sort { ($0.modified ?? .now) < ($1.modified ?? .now) }
-        planQuickWins.sort { $0.bytes > $1.bytes }
-    }
-
     func toggleSelection(_ item: FileItem) {
         guard item.cleanupRestriction == nil else { error = item.cleanupRestriction; return }
-        if selectedIDs.contains(item.id) { selectedIDs.remove(item.id) } else { selectedIDs.insert(item.id) }
+        if selectedIDs.contains(item.id) { selectedIDs.remove(item.id); selectedItemIndex.removeValue(forKey:item.id) }
+        else { selectedIDs.insert(item.id); selectedItemIndex[item.id] = item }
     }
-    func select(_ items: [FileItem]) { selectedIDs.formUnion(items.filter { $0.cleanupRestriction == nil }.map(\.id)) }
-    func clearSelection() { selectedIDs.removeAll() }
+    func select(_ items: [FileItem]) {
+        let eligible=items.filter { $0.cleanupRestriction == nil }
+        for item in eligible { selectedItemIndex[item.id] = item }
+        selectedIDs.formUnion(eligible.map(\.id))
+    }
+    func clearSelection() { selectedIDs.removeAll(); selectedItemIndex.removeAll(keepingCapacity:true) }
     func selectDuplicateCopies(in group: [FileItem]) {
         let ordered = group.sorted { Self.keeperScore($0) > Self.keeperScore($1) }
         select(Array(ordered.dropFirst()))
@@ -280,7 +282,7 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         cancelWork()
         let token = generation
         status = "Scanning file metadata in the background…"
-        scanning = true; progress = 0; error = nil; files = []; largestFiles = []; totalBytes = 0; safeFiles = []; oldFiles = []; quickWins = []; planLargeFiles = []; planOldFiles = []; planQuickWins = []; categoryBytes = [:]; categoryIndex = [:]; duplicateCopyIDs = []; selectedIDs = []; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; developerTargets = []; developerAnalyzed = false; scannedURL = url
+        scanning = true; progress = 0; error = nil; files = []; largestFiles = []; totalBytes = 0; safeFiles = []; oldFiles = []; quickWins = []; planLargeFiles = []; planOldFiles = []; planQuickWins = []; categoryBytes = [:]; categoryIndex = [:]; duplicateCopyIDs = []; selectedIDs = []; selectedItemIndex = [:]; duplicateGroups = []; duplicateScanning = false; duplicatesAnalyzed = false; developerTargets = []; developerAnalyzed = false; scannedURL = url
         let oldCutoff=Calendar.current.date(byAdding:.year,value:-1,to:.now)!, quickCutoff=Calendar.current.date(byAdding:.day,value:-30,to:.now)!
         scanTask = Task {
             for await batch in Self.fileBatches(at: url) {
@@ -444,11 +446,71 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         catch { return nil }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
+
+    private func collectionsSnapshot() -> ScanCollections {
+        ScanCollections(files:files,largestFiles:largestFiles,totalBytes:totalBytes,safeFiles:safeFiles,oldFiles:oldFiles,quickWins:quickWins,planLargeFiles:planLargeFiles,planOldFiles:planOldFiles,planQuickWins:planQuickWins,categoryBytes:categoryBytes,categoryIndex:categoryIndex)
+    }
+
+    private func applyCollections(_ snapshot: ScanCollections) {
+        files=snapshot.files; largestFiles=snapshot.largestFiles; totalBytes=snapshot.totalBytes
+        safeFiles=snapshot.safeFiles; oldFiles=snapshot.oldFiles; quickWins=snapshot.quickWins
+        planLargeFiles=snapshot.planLargeFiles; planOldFiles=snapshot.planOldFiles; planQuickWins=snapshot.planQuickWins
+        categoryBytes=snapshot.categoryBytes; categoryIndex=snapshot.categoryIndex
+    }
+
+    private func removeFromSelection(ids: Set<UUID>, pathPrefixes: [String] = []) {
+        selectedItemIndex = selectedItemIndex.filter { id,item in
+            !ids.contains(id) && !pathPrefixes.contains { item.url.path.hasPrefix($0) }
+        }
+        selectedIDs = Set(selectedItemIndex.keys)
+    }
+
+    nonisolated private static func pruning(_ snapshot: ScanCollections, removingIDs: Set<UUID>, pathPrefixes: [String] = []) -> ScanCollections {
+        func removed(_ item: FileItem) -> Bool {
+            removingIDs.contains(item.id) || pathPrefixes.contains { item.url.path.hasPrefix($0) }
+        }
+        var removedBytes:Int64 = 0
+        var removedCategoryBytes:[String:Int64] = [:]
+        var retainedFiles:[FileItem] = []; retainedFiles.reserveCapacity(snapshot.files.count)
+        for item in snapshot.files {
+            if removed(item) { removedBytes += item.bytes; removedCategoryBytes[item.kind,default:0] += item.bytes }
+            else { retainedFiles.append(item) }
+        }
+        var retainedCategoryBytes=snapshot.categoryBytes
+        for (category,bytes) in removedCategoryBytes { retainedCategoryBytes[category] = max(0,(retainedCategoryBytes[category] ?? 0)-bytes) }
+        retainedCategoryBytes = retainedCategoryBytes.filter { $0.value > 0 }
+        let retainedCategoryIndex = snapshot.categoryIndex.reduce(into:[String:[FileItem]]()) { result,entry in
+            let items=entry.value.filter { !removed($0) }
+            if !items.isEmpty { result[entry.key]=items }
+        }
+        return ScanCollections(
+            files:retainedFiles,
+            largestFiles:snapshot.largestFiles.filter { !removed($0) },
+            totalBytes:max(0,snapshot.totalBytes-removedBytes),
+            safeFiles:snapshot.safeFiles.filter { !removed($0) },
+            oldFiles:snapshot.oldFiles.filter { !removed($0) },
+            quickWins:snapshot.quickWins.filter { !removed($0) },
+            planLargeFiles:snapshot.planLargeFiles.filter { !removed($0) },
+            planOldFiles:snapshot.planOldFiles.filter { !removed($0) },
+            planQuickWins:snapshot.planQuickWins.filter { !removed($0) },
+            categoryBytes:retainedCategoryBytes,
+            categoryIndex:retainedCategoryIndex
+        )
+    }
+
+    private func beginCleanup(total: Int, message: String) {
+        cleanupBusy=true; cleanupCompleted=0; cleanupTotal=max(total,1); status=message
+    }
+
+    private func finishCleanupProgress() {
+        cleanupBusy=false; cleanupCompleted=0; cleanupTotal=0
+    }
+
     func trash(_ item: FileItem) {
         guard !cleanupBusy && !scanning && !duplicateScanning else { return }
         if let reason = item.cleanupRestriction { error = reason; return }
-        cleanupBusy = true
-        status = "Moving \(item.name) to Trash…"
+        let snapshot=collectionsSnapshot()
+        beginCleanup(total:1,message:"Moving \(item.name) to Trash…")
         Task.detached(priority: .utility) {
             let resolved = item.url.resolvingSymlinksInPath()
             let checked = FileItem(url: resolved, bytes: item.bytes, modified: item.modified)
@@ -464,13 +526,13 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
                 await Self.reportAnonymousCleanup(bytes: item.bytes)
             }
             let result = failure
+            let pruned = result == nil ? Self.pruning(snapshot,removingIDs:[item.id]) : nil
             await MainActor.run {
-                self.cleanupBusy = false
+                self.finishCleanupProgress()
                 if let result { self.error = result; self.status = "Item was not removed." }
                 else {
-                    self.files.removeAll { $0.id == item.id }
-                    self.rebuildIndexes()
-                    self.selectedIDs.remove(item.id)
+                    if let pruned { self.applyCollections(pruned) }
+                    self.removeFromSelection(ids:[item.id])
                     self.duplicateGroups = []; self.duplicateCopyIDs = []; self.duplicatesAnalyzed = false
                     self.cleanupReceipt = CleanupReceipt(movedCount: 1, movedBytes: item.bytes, failedCount: 0, completedAt: .now)
                     self.showingCleanupReceipt = true
@@ -483,24 +545,35 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         guard !cleanupBusy && !scanning && !duplicateScanning else { return }
         let targets = selectedItems.filter { $0.cleanupRestriction == nil }
         guard !targets.isEmpty else { error = "Select at least one removable item first."; return }
-        cleanupBusy = true
-        status = "Moving \(targets.count) selected items to Trash…"
+        let snapshot=collectionsSnapshot()
+        beginCleanup(total:targets.count,message:"Preparing to move \(targets.count) selected items to Trash…")
         Task.detached(priority: .utility) {
             var movedIDs: Set<UUID> = []; var movedBytes: Int64 = 0; var failed = 0
-            for item in targets {
+            let updateEvery=max(1,min(25,targets.count/50))
+            for (index,item) in targets.enumerated() {
                 if Task.isCancelled { break }
                 let resolved = item.url.resolvingSymlinksInPath()
                 let checked = FileItem(url: resolved, bytes: item.bytes, modified: item.modified)
-                if checked.cleanupRestriction != nil || !FileManager.default.isDeletableFile(atPath: item.url.path) { failed += 1; continue }
-                do { try FileManager.default.trashItem(at: item.url, resultingItemURL: nil); movedIDs.insert(item.id); movedBytes += item.bytes }
-                catch { failed += 1 }
+                if checked.cleanupRestriction != nil || !FileManager.default.isDeletableFile(atPath: item.url.path) { failed += 1 }
+                else {
+                    do { try FileManager.default.trashItem(at: item.url, resultingItemURL: nil); movedIDs.insert(item.id); movedBytes += item.bytes }
+                    catch { failed += 1 }
+                }
+                let completed=index+1
+                if completed == targets.count || completed % updateEvery == 0 {
+                    await MainActor.run {
+                        self.cleanupCompleted=completed
+                        self.status="Moving selected items to Trash… \(completed.formatted()) of \(targets.count.formatted())"
+                    }
+                }
             }
             if movedBytes > 0 && UserDefaults.standard.bool(forKey: "disksift.share-anonymous-impact") { await Self.reportAnonymousCleanup(bytes: movedBytes) }
+            await MainActor.run { self.status="Refreshing results in the background…" }
+            let pruned=Self.pruning(snapshot,removingIDs:movedIDs)
             await MainActor.run {
-                self.files.removeAll { movedIDs.contains($0.id) }
-                self.rebuildIndexes()
-                self.selectedIDs.subtract(movedIDs)
-                self.cleanupBusy = false; self.duplicateGroups = []; self.duplicateCopyIDs = []; self.duplicatesAnalyzed = false
+                self.applyCollections(pruned)
+                self.removeFromSelection(ids:movedIDs)
+                self.finishCleanupProgress(); self.duplicateGroups = []; self.duplicateCopyIDs = []; self.duplicatesAnalyzed = false
                 self.cleanupReceipt = CleanupReceipt(movedCount: movedIDs.count, movedBytes: movedBytes, failedCount: failed, completedAt: .now)
                 self.showingCleanupReceipt = true
                 self.status = failed == 0 ? "Cleanup complete. Items are recoverable from Trash." : "Cleanup finished. \(failed) item(s) were left in place because macOS did not allow access."
@@ -510,19 +583,21 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
     func trashDeveloperTarget(_ target: DeveloperCleanupTarget) {
         guard !cleanupBusy && Self.allowedDeveloperTarget(target) else { error = "DiskSift blocked this folder because it is outside the supported developer cleanup locations."; return }
         guard FileManager.default.fileExists(atPath:target.url.path) else { error = "This folder no longer exists. Refresh developer storage to update the list."; return }
-        cleanupBusy = true; status = "Moving \(target.title) to Trash…"
+        let snapshot=collectionsSnapshot()
+        beginCleanup(total:1,message:"Moving \(target.title) to Trash…")
         Task.detached(priority:.utility) {
             var failure:String?
             if !Self.allowedDeveloperTarget(target) { failure = "Safety validation failed; the folder was left in place." }
             else if !FileManager.default.isDeletableFile(atPath:target.url.path) { failure = "macOS did not allow DiskSift to move this folder. Close the owning developer tool and try again." }
             else { do { try FileManager.default.trashItem(at:target.url,resultingItemURL:nil) } catch { failure = error.localizedDescription } }
             if failure == nil && UserDefaults.standard.bool(forKey:"disksift.share-anonymous-impact") { await Self.reportAnonymousCleanup(bytes:target.bytes) }
+            let prefix=target.url.standardizedFileURL.path + "/"
+            let pruned = failure == nil ? Self.pruning(snapshot,removingIDs:[],pathPrefixes:[prefix]) : nil
             await MainActor.run {
-                self.cleanupBusy = false
+                self.finishCleanupProgress()
                 if let failure { self.error = "Could not move \(target.title) to Trash: \(failure)"; self.status = "Developer folder was left in place."; return }
-                let prefix = target.url.standardizedFileURL.path + "/"
-                self.files.removeAll { $0.url.standardizedFileURL.path.hasPrefix(prefix) }
-                self.rebuildIndexes()
+                if let pruned { self.applyCollections(pruned) }
+                self.removeFromSelection(ids:[],pathPrefixes:[prefix])
                 self.developerTargets.removeAll { $0.id == target.id }
                 self.cleanupReceipt = CleanupReceipt(movedCount:1,movedBytes:target.bytes,failedCount:0,completedAt:.now)
                 self.showingCleanupReceipt = true
@@ -534,25 +609,34 @@ struct DeveloperCleanupTarget: Identifiable, Hashable, Sendable {
         guard !cleanupBusy else { return }
         let candidates = targets.filter { Self.allowedDeveloperTarget($0) }
         guard !candidates.isEmpty else { error = "There is no supported developer storage to clean up."; return }
-        cleanupBusy = true; status = "Moving \(candidates.count) developer folders to Trash…"
+        let snapshot=collectionsSnapshot()
+        beginCleanup(total:candidates.count,message:"Preparing to move \(candidates.count) developer folders to Trash…")
         Task.detached(priority:.utility) {
             var movedIDs:Set<String> = []; var movedBytes:Int64 = 0; var failed = 0; var movedPrefixes:[String] = []
-            for target in candidates {
+            for (index,target) in candidates.enumerated() {
                 if Task.isCancelled { break }
-                guard Self.allowedDeveloperTarget(target),
-                      FileManager.default.fileExists(atPath:target.url.path),
-                      FileManager.default.isDeletableFile(atPath:target.url.path) else { failed += 1; continue }
-                do {
-                    try FileManager.default.trashItem(at:target.url,resultingItemURL:nil)
-                    movedIDs.insert(target.id); movedBytes += target.bytes
-                    movedPrefixes.append(target.url.standardizedFileURL.path + "/")
-                } catch { failed += 1 }
+                if Self.allowedDeveloperTarget(target),
+                   FileManager.default.fileExists(atPath:target.url.path),
+                   FileManager.default.isDeletableFile(atPath:target.url.path) {
+                    do {
+                        try FileManager.default.trashItem(at:target.url,resultingItemURL:nil)
+                        movedIDs.insert(target.id); movedBytes += target.bytes
+                        movedPrefixes.append(target.url.standardizedFileURL.path + "/")
+                    } catch { failed += 1 }
+                } else { failed += 1 }
+                let completed=index+1
+                await MainActor.run {
+                    self.cleanupCompleted=completed
+                    self.status="Moving developer folders to Trash… \(completed) of \(candidates.count)"
+                }
             }
             if movedBytes > 0 && UserDefaults.standard.bool(forKey:"disksift.share-anonymous-impact") { await Self.reportAnonymousCleanup(bytes:movedBytes) }
+            await MainActor.run { self.status="Refreshing results in the background…" }
+            let pruned=Self.pruning(snapshot,removingIDs:[],pathPrefixes:movedPrefixes)
             await MainActor.run {
-                self.cleanupBusy = false
-                self.files.removeAll { item in movedPrefixes.contains { item.url.standardizedFileURL.path.hasPrefix($0) } }
-                self.rebuildIndexes()
+                self.applyCollections(pruned)
+                self.removeFromSelection(ids:[],pathPrefixes:movedPrefixes)
+                self.finishCleanupProgress()
                 self.developerTargets.removeAll { movedIDs.contains($0.id) }
                 self.cleanupReceipt = CleanupReceipt(movedCount:movedIDs.count,movedBytes:movedBytes,failedCount:failed,completedAt:.now)
                 self.showingCleanupReceipt = true
@@ -630,7 +714,7 @@ struct ContentView: View {
     }
     @ViewBuilder var detail: some View {
         if scan.scannedURL == nil { WelcomeView() }
-        else { VStack(spacing: 0) { header; if scan.scanning || scan.duplicateScanning { HStack { ProgressView().controlSize(.small); Text(scan.scanning ? "\(scan.files.count.formatted()) files found" : "Verifying duplicates"); Spacer(); Button("Stop") { scan.cancelWork() } }.padding(.horizontal, 28) }; Text(scan.status).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 28); Group { switch section { case .overview: OverviewView(); case .safe: SafeToDeleteView(); case .cleanup: CleanupPlanView(); case .quick: QuickWinsView(); case .all: AllFilesView(); case .large: LargeFilesView(); case .old: OldFilesView(); case .duplicates: DuplicatesView(); case .developer: DeveloperJunkView() } }; if license.isPro && !scan.selectedIDs.isEmpty { HStack { VStack(alignment:.leading) { Text("\(scan.selectedIDs.count) selected").font(.headline); Text("\(format(scan.selectedBytes)) will move to Trash").font(.caption).foregroundStyle(.secondary); if scan.selectedUnsafeCount > 0 { Text("\(scan.selectedUnsafeCount) selected item(s) are not marked Safe to Delete").font(.caption.bold()).foregroundStyle(.orange) } }; Spacer(); Button("Clear") { scan.clearSelection() }; Button("Clean This Up") { confirmBatch = true }.buttonStyle(.borderedProminent).tint(.purple).disabled(scan.cleanupBusy || scan.scanning) }.padding(14).background(.bar).confirmationDialog("Move \(scan.selectedIDs.count) items to Trash?", isPresented: $confirmBatch) { Button("Move \(scan.selectedIDs.count) Items to Trash", role:.destructive) { scan.trashSelected() }; Button("Cancel", role:.cancel) {} } message: { Text(scan.selectedUnsafeCount == 0 ? "Every selected item is marked Safe to Delete. DiskSift will revalidate them and move them to Trash." : "Some selected items are not marked Safe to Delete. Confirm you recognize them before continuing. DiskSift will leave protected locations untouched, and moved items remain recoverable until Trash is emptied.") } } }.environmentObject(scan).environmentObject(license) }
+        else { VStack(spacing: 0) { header; if scan.scanning || scan.duplicateScanning || scan.cleanupBusy { HStack { if scan.cleanupBusy && scan.cleanupTotal > 1 { ProgressView(value:Double(scan.cleanupCompleted),total:Double(scan.cleanupTotal)).frame(width:120) } else { ProgressView().controlSize(.small) }; Text(scan.cleanupBusy ? "Cleaning up \(scan.cleanupCompleted.formatted()) of \(scan.cleanupTotal.formatted())" : (scan.scanning ? "\(scan.files.count.formatted()) files found" : "Verifying duplicates")); Spacer(); if !scan.cleanupBusy { Button("Stop") { scan.cancelWork() } } }.padding(.horizontal, 28) }; Text(scan.status).font(.caption).foregroundStyle(.secondary).padding(.horizontal, 28); Group { switch section { case .overview: OverviewView(); case .safe: SafeToDeleteView(); case .cleanup: CleanupPlanView(); case .quick: QuickWinsView(); case .all: AllFilesView(); case .large: LargeFilesView(); case .old: OldFilesView(); case .duplicates: DuplicatesView(); case .developer: DeveloperJunkView() } }; if license.isPro && !scan.selectedIDs.isEmpty { HStack { VStack(alignment:.leading) { Text("\(scan.selectedIDs.count) selected").font(.headline); Text("\(format(scan.selectedBytes)) will move to Trash").font(.caption).foregroundStyle(.secondary); if scan.selectedUnsafeCount > 0 { Text("\(scan.selectedUnsafeCount) selected item(s) are not marked Safe to Delete").font(.caption.bold()).foregroundStyle(.orange) } }; Spacer(); Button("Clear") { scan.clearSelection() }.disabled(scan.cleanupBusy); Button("Clean This Up") { confirmBatch = true }.buttonStyle(.borderedProminent).tint(.purple).disabled(scan.cleanupBusy || scan.scanning) }.padding(14).background(.bar).confirmationDialog("Move \(scan.selectedIDs.count) items to Trash?", isPresented: $confirmBatch) { Button("Move \(scan.selectedIDs.count) Items to Trash", role:.destructive) { scan.trashSelected() }; Button("Cancel", role:.cancel) {} } message: { Text(scan.selectedUnsafeCount == 0 ? "Every selected item is marked Safe to Delete. DiskSift will revalidate them and move them to Trash." : "Some selected items are not marked Safe to Delete. Confirm you recognize them before continuing. DiskSift will leave protected locations untouched, and moved items remain recoverable until Trash is emptied.") } } }.environmentObject(scan).environmentObject(license) }
     }
     var header: some View { HStack { VStack(alignment: .leading) { Text(section.rawValue).font(.title.bold()); Text(scan.scannedURL?.path(percentEncoded: false) ?? "").lineLimit(1).font(.caption).foregroundStyle(.secondary) }; Spacer(); TextField("Search files and folders", text:$scan.searchText).textFieldStyle(.roundedBorder).frame(maxWidth:260); Button { scan.chooseFolder() } label: { Label("Scan", systemImage: "folder.badge.gearshape") }.buttonStyle(.borderedProminent).tint(.purple) }.padding(24) }
 }
